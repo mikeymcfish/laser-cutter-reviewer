@@ -24,7 +24,7 @@ from defusedxml import ElementTree as SafeET
 from defusedxml.common import DefusedXmlException
 from fontTools.ttLib import TTFont
 from PIL import Image, UnidentifiedImageError
-from shapely import minimum_clearance
+from shapely import shortest_line
 from shapely.geometry import LineString, Polygon
 from shapely.ops import polygonize, unary_union
 from shapely.strtree import STRtree
@@ -45,11 +45,13 @@ from .models import (
     PreviewPiece,
     PreviewRasterAsset,
     PreviewRasterLayer,
+    PreviewWeakPoint,
     ProcessProfile,
     ProfileReference,
     ReportSummary,
     Selection,
     SummaryCounts,
+    WeakPointPreview,
 )
 
 
@@ -61,6 +63,7 @@ CURVE_CHORD_ERROR_MM = 0.03
 MAX_FLATTENED_CHORD_MM = 0.5
 MAX_CURVE_SUBDIVISION_DEPTH = 14
 MAX_PAIRWISE_GEOMETRY_CHECKS = 100_000
+MAX_WEAK_POINT_MARKERS = 200
 TRANSPARENT_PNG_DATA_URI = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAFgAI/7f0M"
@@ -174,6 +177,19 @@ class ExtractedPath:
     dash: str | None
     ambiguous_transform: bool
     source_id: str
+    raster_viewport_aspect_ratio: float | None = None
+
+
+@dataclass(frozen=True)
+class WeakPointCandidate:
+    kind: str
+    label: str
+    object_ids: tuple[str, ...]
+    location_mm: tuple[float, float]
+    span_mm: tuple[tuple[float, float], tuple[float, float]] | None
+    measurement: float
+    threshold: float
+    unit: str
 
 
 def _local_name(tag: str) -> str:
@@ -183,6 +199,121 @@ def _local_name(tag: str) -> str:
 def _round(value: float, digits: int = 4) -> float:
     rounded = round(float(value), digits)
     return 0.0 if rounded == -0.0 else rounded
+
+
+def _finite_span(line: LineString) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    if line.is_empty:
+        return None
+    coordinates = list(line.coords)
+    if len(coordinates) < 2:
+        return None
+    first = (float(coordinates[0][0]), float(coordinates[0][1]))
+    last = (float(coordinates[-1][0]), float(coordinates[-1][1]))
+    if not all(math.isfinite(value) for point in (first, last) for value in point):
+        return None
+    return (
+        (_round(first[0]), _round(first[1])),
+        (_round(last[0]), _round(last[1])),
+    )
+
+
+def _narrow_feature_span(
+    polygon: Polygon,
+    threshold: float,
+    remaining_checks: int,
+) -> tuple[LineString | None, int, bool]:
+    """Locate a defensible interior cross-section below ``threshold``.
+
+    GEOS minimum clearance is intentionally not used here: for a tessellated
+    curve it measures how far a sampled vertex can move before topology becomes
+    invalid, which is often just the curve's chord length rather than material
+    width. Instead, this scans non-adjacent boundary segments and retains only
+    connectors whose midpoint has roughly half the connector length of material
+    clearance. That interior-clearance condition rejects neighboring chords on
+    smooth curves while accepting opposing sides of a strip or neck.
+    """
+    coordinates = list(polygon.exterior.coords)
+    edge_count = max(0, len(coordinates) - 1)
+    if edge_count < 3 or remaining_checks <= 0:
+        return None, 0, remaining_checks <= 0
+
+    records: list[tuple[int, LineString]] = []
+    for index in range(edge_count):
+        edge = LineString((coordinates[index], coordinates[index + 1]))
+        if math.isfinite(edge.length) and edge.length > 1e-9:
+            records.append((index, edge))
+    if len(records) < 3:
+        return None, 0, False
+
+    edges = [edge for _, edge in records]
+    tree = STRtree(edges)
+    checks = 0
+    best: LineString | None = None
+    best_length = math.inf
+    boundary = polygon.boundary
+    tolerance = max(1e-7, threshold * 1e-7)
+
+    for record_index, (source_index, source) in enumerate(records):
+        for candidate_value in tree.query(source.buffer(threshold)):
+            candidate_index = int(candidate_value)
+            if candidate_index <= record_index:
+                continue
+            target_index, target = records[candidate_index]
+            index_distance = abs(source_index - target_index)
+            if index_distance == 1 or index_distance == edge_count - 1:
+                continue
+            checks += 1
+            if checks > remaining_checks:
+                return best, remaining_checks, True
+            if source.distance(target) >= threshold:
+                continue
+
+            # Parallel edges have infinitely many shortest connectors and GEOS
+            # may choose one along an adjacent end edge. Projecting each edge's
+            # midpoint onto the other supplies an interior candidate instead.
+            for start_edge, end_edge in ((source, target), (target, source)):
+                start = start_edge.interpolate(0.5, normalized=True)
+                end = end_edge.interpolate(end_edge.project(start))
+                connector = LineString((start.coords[0], end.coords[0]))
+                length = float(connector.length)
+                if (
+                    not math.isfinite(length)
+                    or length <= tolerance
+                    or length >= threshold
+                    or not polygon.covers(connector)
+                ):
+                    continue
+                midpoint = connector.interpolate(0.5, normalized=True)
+                midpoint_clearance = float(midpoint.distance(boundary))
+                if not math.isfinite(midpoint_clearance) or midpoint_clearance + tolerance < length * 0.45:
+                    continue
+                if length < best_length:
+                    best = connector
+                    best_length = length
+
+    return best, checks, False
+
+
+def _weak_candidate_key(candidate: WeakPointCandidate) -> tuple[Any, ...]:
+    risk_ratio = candidate.measurement / candidate.threshold
+    return (
+        risk_ratio,
+        candidate.kind,
+        candidate.object_ids,
+        candidate.location_mm,
+    )
+
+
+def _retain_weak_candidate(
+    candidates: list[WeakPointCandidate], candidate: WeakPointCandidate
+) -> bool:
+    """Retain a bounded set of the highest-risk localized estimates."""
+    candidates.append(candidate)
+    if len(candidates) <= MAX_WEAK_POINT_MARKERS * 2:
+        return False
+    candidates.sort(key=_weak_candidate_key)
+    del candidates[MAX_WEAK_POINT_MARKERS:]
+    return True
 
 
 def _format_inches(value_mm: float, digits: int = 4) -> str:
@@ -1227,6 +1358,7 @@ def _extract_paths(
                     dash=None,
                     ambiguous_transform=False,
                     source_id=source_id,
+                    raster_viewport_aspect_ratio=width / height,
                 )
             )
             preview_points += len(coords_mm)
@@ -1623,6 +1755,11 @@ def failure_report(
             page={"width_mm": None, "height_mm": None},
             paths=[],
             pieces=[],
+            weak_points=WeakPointPreview(
+                status="unavailable",
+                message="Potential weak-point locations are unavailable because the SVG could not be normalized safely.",
+                points=[],
+            ),
             valid_3d=False,
             invalid_reason=message,
         ),
@@ -1780,6 +1917,10 @@ def _normalized_geometry_is_unchanged(
             or left.dash != right.dash
             or left.ambiguous_transform != right.ambiguous_transform
             or not _same_optional_number(
+                left.raster_viewport_aspect_ratio,
+                right.raster_viewport_aspect_ratio,
+            )
+            or not _same_optional_number(
                 left.preview.stroke_width_mm, right.preview.stroke_width_mm
             )
             or not _same_bounds(left.preview.bounds, right.preview.bounds)
@@ -1820,18 +1961,18 @@ def fix_artboard(
     profile: LabProfile,
     assignment: AssignmentProfile,
 ) -> FixedArtboardSVG:
-    """Return a verified copy with only the exact-assignment viewport enlarged or reduced."""
+    """Return a verified copy with only the assignment viewport enlarged or reduced."""
     actual_sha256 = hashlib.sha256(data).hexdigest()
     if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256) or actual_sha256 != expected_sha256.lower():
         raise ArtboardFixError(
             "The selected SVG no longer matches the analyzed file. Analyze it again before correcting the artboard."
         )
     if (
-        assignment.page_policy != "exact"
+        assignment.page_policy not in {"exact", "fit_within"}
         or assignment.expected_width_mm is None
         or assignment.expected_height_mm is None
     ):
-        raise ArtboardFixError("This assignment does not define one exact artboard size.")
+        raise ArtboardFixError("This assignment does not define an automatic artboard target.")
 
     root, _ = _validate_xml_safety(data, profile.limits)
     if any(_local_name(element.tag).lower() in {"use", "text"} for element in root.iter()):
@@ -1844,11 +1985,22 @@ def fix_artboard(
         raise ArtboardFixError(
             "The SVG needs explicit physical width and height, a valid viewBox, and matching horizontal and vertical scale before its artboard can be corrected safely."
         )
-    if (
-        abs((scale.width_mm or 0) - assignment.expected_width_mm) <= assignment.page_tolerance_mm
-        and abs((scale.height_mm or 0) - assignment.expected_height_mm) <= assignment.page_tolerance_mm
-    ):
-        raise ArtboardFixError("The SVG artboard already matches the assignment size.")
+    if assignment.page_policy == "exact":
+        target_width_mm = assignment.expected_width_mm
+        target_height_mm = assignment.expected_height_mm
+        already_accepted = (
+            abs((scale.width_mm or 0) - target_width_mm) <= assignment.page_tolerance_mm
+            and abs((scale.height_mm or 0) - target_height_mm) <= assignment.page_tolerance_mm
+        )
+    else:
+        target_width_mm = min(scale.width_mm or assignment.expected_width_mm, assignment.expected_width_mm)
+        target_height_mm = min(scale.height_mm or assignment.expected_height_mm, assignment.expected_height_mm)
+        already_accepted = (
+            (scale.width_mm or 0) <= assignment.expected_width_mm + assignment.page_tolerance_mm
+            and (scale.height_mm or 0) <= assignment.expected_height_mm + assignment.page_tolerance_mm
+        )
+    if already_accepted:
+        raise ArtboardFixError("The SVG artboard already satisfies the assignment size policy.")
 
     rules, unsupported_css = _css_rules(root)
     if not _root_viewport_styles_match(root, rules, scale):
@@ -1867,8 +2019,8 @@ def fix_artboard(
     before_paths = _paths_for_fix_verification(root, metadata, assignment, profile)
     _set_artboard_viewport(
         root,
-        target_width_mm=assignment.expected_width_mm,
-        target_height_mm=assignment.expected_height_mm,
+        target_width_mm=target_width_mm,
+        target_height_mm=target_height_mm,
         viewbox=scale.viewbox,  # type: ignore[arg-type]
         x_scale_mm_per_unit=original_scales[0],
         y_scale_mm_per_unit=original_scales[1],
@@ -1891,8 +2043,8 @@ def fix_artboard(
         or verify_scale.width_mm is None
         or verify_scale.height_mm is None
         or verify_scale.viewbox is None
-        or abs(verify_scale.width_mm - assignment.expected_width_mm) > 1e-7
-        or abs(verify_scale.height_mm - assignment.expected_height_mm) > 1e-7
+        or abs(verify_scale.width_mm - target_width_mm) > 1e-7
+        or abs(verify_scale.height_mm - target_height_mm) > 1e-7
         or not math.isclose(verify_scale.viewbox[0], scale.viewbox[0], rel_tol=0, abs_tol=1e-10)  # type: ignore[index]
         or not math.isclose(verify_scale.viewbox[1], scale.viewbox[1], rel_tol=0, abs_tol=1e-10)  # type: ignore[index]
         or not math.isclose(verify_scales[0], original_scales[0], rel_tol=1e-9, abs_tol=1e-11)
@@ -1918,8 +2070,8 @@ def fix_artboard(
         raise ArtboardFixError("The artboard correction would move or scale artwork, so no copy was created.")
     return FixedArtboardSVG(
         data=fixed_data,
-        target_width_mm=assignment.expected_width_mm,
-        target_height_mm=assignment.expected_height_mm,
+        target_width_mm=target_width_mm,
+        target_height_mm=target_height_mm,
     )
 
 
@@ -2108,6 +2260,9 @@ def analyze_svg(
                                 corners_mm=corners,
                                 opacity=image["opacity"],
                                 preserve_aspect_ratio=image["preserve_aspect_ratio"],
+                                viewport_aspect_ratio=(
+                                    placement.raster_viewport_aspect_ratio or 1.0
+                                ),
                             )
                         )
     except UnsafeSVGError as exc:
@@ -2217,6 +2372,17 @@ def analyze_svg(
             abs(scale.width_mm - expected_w) <= assignment.page_tolerance_mm
             and abs(scale.height_mm - expected_h) <= assignment.page_tolerance_mm
         )
+    elif page_ok and assignment.page_policy == "fit_within":
+        maximum_w = assignment.expected_width_mm or 0
+        maximum_h = assignment.expected_height_mm or 0
+        page_evidence = [
+            f"Measured {_format_inches(scale.width_mm)} x {_format_inches(scale.height_mm)}",
+            f"Maximum {_format_inches(maximum_w)} x {_format_inches(maximum_h)}",
+        ]
+        page_ok = (
+            scale.width_mm <= maximum_w + assignment.page_tolerance_mm
+            and scale.height_mm <= maximum_h + assignment.page_tolerance_mm
+        )
     elif page_ok:
         page_evidence = [
             f"Document {_format_inches(scale.width_mm)} x {_format_inches(scale.height_mm)}",
@@ -2227,9 +2393,21 @@ def analyze_svg(
             scale.width_mm <= profile.machine.usable_width_mm + assignment.page_tolerance_mm
             and scale.height_mm <= profile.machine.usable_height_mm + assignment.page_tolerance_mm
         )
+    artboard_target_width_mm = (
+        assignment.expected_width_mm
+        if assignment.page_policy == "exact"
+        else min(scale.width_mm or 0, assignment.expected_width_mm or 0)
+    )
+    artboard_target_height_mm = (
+        assignment.expected_height_mm
+        if assignment.page_policy == "exact"
+        else min(scale.height_mm or 0, assignment.expected_height_mm or 0)
+    )
     can_offer_artboard_fix = bool(
         not page_ok
-        and assignment.page_policy == "exact"
+        and assignment.page_policy in {"exact", "fit_within"}
+        and artboard_target_width_mm
+        and artboard_target_height_mm
         and _artboard_scale_mm_per_unit(scale) is not None
         and _root_aspect_ratio_is_reliable(root)
         and _root_viewport_styles_match(root, rules, scale)
@@ -2245,8 +2423,8 @@ def analyze_svg(
             id="set-artboard",
             kind="set_artboard",
             label=(
-                f"Set artboard to {_format_inches(assignment.expected_width_mm or 0)} x "
-                f"{_format_inches(assignment.expected_height_mm or 0)}"
+                f"Set artboard to {_format_inches(artboard_target_width_mm or 0)} x "
+                f"{_format_inches(artboard_target_height_mm or 0)}"
             ),
             description=(
                 "Creates a separate SVG copy with the assignment artboard size while preserving "
@@ -2255,8 +2433,8 @@ def analyze_svg(
             endpoint="/api/v1/fix-artboard",
             object_ids=[],
             count=1,
-            target_width_in=_round((assignment.expected_width_mm or 0) / 25.4, 6),
-            target_height_in=_round((assignment.expected_height_mm or 0) / 25.4, 6),
+            target_width_in=_round((artboard_target_width_mm or 0) / 25.4, 6),
+            target_height_in=_round((artboard_target_height_mm or 0) / 25.4, 6),
         )
     ] if can_offer_artboard_fix else []
     _add_check(
@@ -2264,9 +2442,23 @@ def analyze_svg(
         rule_id="document.page_size",
         title="Artboard size",
         state="pass" if page_ok else "blocker",
-        message="The artboard matches the assignment policy." if page_ok else "The artboard does not match the assignment page policy.",
+        message=(
+            "The artboard is within the assignment size limit."
+            if page_ok and assignment.page_policy == "fit_within"
+            else "The artboard matches the assignment policy."
+            if page_ok
+            else "The artboard is larger than the assignment allows."
+            if assignment.page_policy == "fit_within"
+            else "The artboard does not match the assignment page policy."
+        ),
         evidence=page_evidence or ["Physical artboard size is unresolved."],
-        fix=None if page_ok else "Set the Illustrator artboard to the assignment size, then export the SVG again.",
+        fix=(
+            None
+            if page_ok
+            else "Reduce the Illustrator artboard to the assignment maximum, then export the SVG again."
+            if assignment.page_policy == "fit_within"
+            else "Set the Illustrator artboard to the assignment size, then export the SVG again."
+        ),
         fix_actions=artboard_fix_actions,
     )
 
@@ -2427,6 +2619,9 @@ def analyze_svg(
     overlap_ids: set[str] = set()
     crossing_ids: set[str] = set()
     close_ids: set[str] = set()
+    weak_point_candidates: list[WeakPointCandidate] = []
+    weak_marker_limit_reached = False
+    weak_location_failure = False
     min_spacing: float | None = None
     topology_limit_reached = False
     topology_pair_checks = 0
@@ -2447,6 +2642,31 @@ def analyze_svg(
                     min_spacing = distance
                 if 0 < distance < material.min_spacing_mm:
                     close_ids.update((item.preview.id, other.preview.id))
+                    spacing_line = shortest_line(item.line, other.line)
+                    spacing_span = _finite_span(spacing_line)
+                    if spacing_span is None:
+                        weak_location_failure = True
+                    else:
+                        spacing_location = (
+                            _round((spacing_span[0][0] + spacing_span[1][0]) / 2),
+                            _round((spacing_span[0][1] + spacing_span[1][1]) / 2),
+                        )
+                        weak_marker_limit_reached = (
+                            _retain_weak_candidate(
+                                weak_point_candidates,
+                                WeakPointCandidate(
+                                    kind="close_cut_spacing",
+                                    label="Close cut spacing",
+                                    object_ids=tuple(sorted((item.preview.id, other.preview.id))),
+                                    location_mm=spacing_location,
+                                    span_mm=spacing_span,
+                                    measurement=float(spacing_line.length),
+                                    threshold=material.min_spacing_mm,
+                                    unit="mm",
+                                ),
+                            )
+                            or weak_marker_limit_reached
+                        )
                 if not item.line.intersects(other.line):
                     continue
                 intersection = item.line.intersection(other.line)
@@ -2625,27 +2845,171 @@ def analyze_svg(
     fragile_ids: set[str] = set(close_ids)
     tiny_ids: set[str] = set()
     clearances: list[float] = []
+    invalid_fragility_paths = 0
+    weak_width_checks = 0
+    weak_width_limit_reached = False
     for item in cut_paths:
         polygon = _polygon_for_path(item)
         if polygon is None or not polygon.is_valid:
+            invalid_fragility_paths += 1
             continue
         cut_polygons.append((item, polygon))
-        clearance = float(minimum_clearance(polygon))
-        if math.isfinite(clearance):
+        clearance_line, checks_used, limit_reached = _narrow_feature_span(
+            polygon,
+            material.min_bridge_mm,
+            max(0, MAX_PAIRWISE_GEOMETRY_CHECKS - weak_width_checks),
+        )
+        weak_width_checks += checks_used
+        weak_width_limit_reached = weak_width_limit_reached or limit_reached
+        clearance_span = _finite_span(clearance_line) if clearance_line is not None else None
+        clearance = float(clearance_line.length) if clearance_line is not None else math.inf
+        if math.isfinite(clearance) and clearance_span is not None:
             clearances.append(clearance)
-            if clearance < material.min_bridge_mm:
-                fragile_ids.add(item.preview.id)
+            fragile_ids.add(item.preview.id)
+            clearance_location = (
+                _round((clearance_span[0][0] + clearance_span[1][0]) / 2),
+                _round((clearance_span[0][1] + clearance_span[1][1]) / 2),
+            )
+            weak_marker_limit_reached = (
+                _retain_weak_candidate(
+                    weak_point_candidates,
+                    WeakPointCandidate(
+                        kind="narrow_feature",
+                        label="Narrow feature",
+                        object_ids=(item.preview.id,),
+                        location_mm=clearance_location,
+                        span_mm=clearance_span,
+                        measurement=clearance,
+                        threshold=material.min_bridge_mm,
+                        unit="mm",
+                    ),
+                )
+                or weak_marker_limit_reached
+            )
         if polygon.area < material.min_piece_area_mm2:
             tiny_ids.add(item.preview.id)
             fragile_ids.add(item.preview.id)
+            representative = polygon.representative_point()
+            tiny_location = (float(representative.x), float(representative.y))
+            if all(math.isfinite(value) for value in tiny_location):
+                weak_marker_limit_reached = (
+                    _retain_weak_candidate(
+                        weak_point_candidates,
+                        WeakPointCandidate(
+                            kind="tiny_piece",
+                            label="Tiny loose-piece estimate",
+                            object_ids=(item.preview.id,),
+                            location_mm=(_round(tiny_location[0]), _round(tiny_location[1])),
+                            span_mm=None,
+                            measurement=float(polygon.area),
+                            threshold=material.min_piece_area_mm2,
+                            unit="mm2",
+                        ),
+                    )
+                    or weak_marker_limit_reached
+                )
+            else:
+                weak_location_failure = True
+
+    weak_point_candidates.sort(key=_weak_candidate_key)
+    if len(weak_point_candidates) > MAX_WEAK_POINT_MARKERS:
+        weak_marker_limit_reached = True
+        del weak_point_candidates[MAX_WEAK_POINT_MARKERS:]
+    weak_preview_points = [
+        PreviewWeakPoint(
+            id=f"weak-point-{index:04d}",
+            kind=candidate.kind,  # type: ignore[arg-type]
+            label=candidate.label,
+            object_ids=list(candidate.object_ids),
+            location_mm=candidate.location_mm,
+            span_mm=candidate.span_mm,
+            measurement=_round(candidate.measurement),
+            threshold=_round(candidate.threshold),
+            unit=candidate.unit,  # type: ignore[arg-type]
+        )
+        for index, candidate in enumerate(weak_point_candidates, start=1)
+    ]
+
     total_cut_length = sum(item.line.length for item in cut_paths)
     page_area = (scale.width_mm or 0) * (scale.height_mm or 0)
     cut_density = total_cut_length / page_area if page_area else 0.0
     dense = bool(page_area and cut_density > material.heat_density_threshold_mm_per_mm2)
+
+    weak_status = "complete"
+    weak_status_reasons: list[str] = []
+    if scale.confidence == "unresolved":
+        # Normalized millimeter measurements are not trustworthy without a
+        # resolved physical scale, so never expose localized estimates here.
+        weak_preview_points = []
+        weak_status = "unavailable"
+        weak_status_reasons.append(
+            "A resolved physical scale is needed to locate potential weak points."
+        )
+    elif not cut_paths:
+        weak_status = "unavailable"
+        weak_status_reasons.append(
+            "Approved through-cut geometry is needed to locate potential weak points."
+        )
+    elif not cut_polygons:
+        if weak_preview_points:
+            weak_status = "partial"
+            weak_status_reasons.append(
+                "Close cut spacing was localized, but valid closed regions are needed to scan narrow features and tiny pieces."
+            )
+        else:
+            weak_status = "unavailable"
+            weak_status_reasons.append(
+                "Valid closed through-cut regions are needed to locate potential weak points."
+            )
+    else:
+        if invalid_fragility_paths or topology_ids:
+            weak_status_reasons.append("Invalid or open cut topology excluded some regions.")
+        if topology_limit_reached:
+            weak_status_reasons.append("The pairwise geometry safety limit was reached.")
+        if weak_width_limit_reached:
+            weak_status_reasons.append("The narrow-feature geometry safety limit was reached.")
+        if weak_location_failure:
+            weak_status_reasons.append("Some localized measurement spans could not be resolved safely.")
+        if weak_marker_limit_reached:
+            weak_status_reasons.append(
+                f"Only the {MAX_WEAK_POINT_MARKERS} highest-risk locations are shown."
+            )
+        if weak_status_reasons:
+            weak_status = "partial"
+
+    if weak_status == "complete" and weak_preview_points:
+        weak_message = (
+            f"Showing {len(weak_preview_points)} potential weak-point "
+            f"{('estimate' if len(weak_preview_points) == 1 else 'estimates')} below the selected material guidelines."
+        )
+    elif weak_status == "complete" and dense:
+        weak_message = (
+            "No localized weak point fell below the selected material guidelines; the heat-density warning applies to the document as a whole."
+        )
+    elif weak_status == "complete":
+        weak_message = "No potential weak points fell below the selected material guidelines."
+    elif weak_status == "partial":
+        weak_message = (
+            f"Showing {len(weak_preview_points)} localized estimate(s), but this scan is not exhaustive. "
+            + " ".join(weak_status_reasons)
+        )
+    else:
+        weak_message = weak_status_reasons[0]
+
+    weak_point_preview = WeakPointPreview(
+        status=weak_status,  # type: ignore[arg-type]
+        message=weak_message,
+        points=weak_preview_points,
+    )
+    minimum_close_measurement = min(
+        (item.measurement for item in weak_point_candidates if item.kind == "close_cut_spacing"),
+        default=min_spacing or 0,
+    )
     fragility_evidence: list[str] = []
     if close_ids:
         fragility_evidence.append(
-            f"{len(close_ids)} path(s) are closer than {_format_inches(material.min_spacing_mm)}"
+            f"{len(close_ids)} path(s) are closer than {_format_inches(material.min_spacing_mm)}; "
+            f"smallest measured gap {_format_inches(minimum_close_measurement)}"
         )
     if tiny_ids:
         fragility_evidence.append(
@@ -2661,16 +3025,38 @@ def analyze_svg(
             f"Cut density {cut_density * 25.4:.3f} in/in² exceeds the "
             f"{material.heat_density_threshold_mm_per_mm2 * 25.4:.3f} in/in² guideline"
         )
+    if weak_status != "complete":
+        fragility_evidence.append(weak_message)
+    fragility_state = (
+        "warning"
+        if fragile_ids or dense
+        else "unverified"
+        if weak_status != "complete"
+        else "pass"
+    )
+    fragile_object_ids = sorted(fragile_ids)[: MAX_WEAK_POINT_MARKERS * 2]
     _add_check(
         checks,
         rule_id="material.fragility",
         title="Estimated feature strength and spacing",
-        state="warning" if fragile_ids or dense else "pass",
-        message="Material-dependent fragile or heat-dense areas need instructor review." if fragile_ids or dense else "No features fall below the demo material thresholds.",
+        state=fragility_state,
+        message=(
+            "Potential weak points or heat-dense areas need instructor review."
+            if fragile_ids or dense
+            else "Potential weak points could not be fully verified."
+            if weak_status != "complete"
+            else "No features fall below the selected material thresholds."
+        ),
         evidence=fragility_evidence,
-        fix="Increase bridges and spacing, remove tiny loose pieces, or ask the instructor to review the highlighted geometry." if fragile_ids or dense else None,
-        object_ids=sorted(fragile_ids),
-        bounds=_bounds_for_ids(paths, fragile_ids),
+        fix=(
+            "Increase bridges and spacing, remove tiny loose pieces, or ask the instructor to review the highlighted estimates."
+            if fragile_ids or dense
+            else "Repair blocking cut topology, then review the potential weak-point overlay again."
+            if weak_status != "complete"
+            else None
+        ),
+        object_ids=fragile_object_ids,
+        bounds=_bounds_for_ids(paths, fragile_object_ids),
     )
 
     ordering_ids: set[str] = set()
@@ -2784,6 +3170,8 @@ def analyze_svg(
         "smallest_piece_area_mm2": min((piece.area_mm2 for piece in pieces), default=None),
         "minimum_feature_mm": _round(min(clearances), 3) if clearances else None,
         "minimum_cut_spacing_mm": _round(min_spacing, 3) if min_spacing is not None else None,
+        "weak_point_count": len(weak_preview_points),
+        "weak_point_scan_status": weak_status,
         "cut_density_mm_per_mm2": _round(cut_density, 4),
         "heat_density_threshold_mm_per_mm2": material.heat_density_threshold_mm_per_mm2,
         "material": material.name,
@@ -2829,6 +3217,7 @@ def analyze_svg(
             pieces=pieces,
             raster_assets=raster_assets,
             raster_layers=raster_layers,
+            weak_points=weak_point_preview,
             valid_3d=valid_3d,
             invalid_reason="; ".join(dict.fromkeys(invalid_3d_reasons)) if invalid_3d_reasons else None,
         ),

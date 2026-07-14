@@ -11,9 +11,9 @@ short_description: Student SVG preflight for Epilog laser cutter projects
 
 # Laser Cutter Reviewer
 
-Laser Cutter Reviewer is a student-facing preflight tool for Adobe Illustrator SVG exports. It checks document setup, vector cut geometry, embedded resources, and material-dependent risk indicators before a file reaches the instructor. The classroom assignments default to a 12 x 12 inch artboard, and physical measurements are presented in inches while the analyzer continues to normalize geometry internally in millimeters. Results include an annotated 2D view, an approximate material preview, and a fingerprinted PDF report.
+Laser Cutter Reviewer is a student-facing preflight tool for Adobe Illustrator SVG exports. It checks document setup, vector cut geometry, embedded resources, and material-dependent risk indicators before a file reaches the instructor. The classroom assignments allow artboards up to 12 x 12 inches by default, and physical measurements are presented in inches while the analyzer continues to normalize geometry internally in millimeters. Results include an annotated 2D view, an approximate material preview, and a fingerprinted PDF report.
 
-The app never changes the uploaded original, sets laser power/speed, or certifies that a job is safe to run. When the analyzer offers a correction, one click downloads a separate corrected SVG and immediately runs that copy through the full review again so its updated preview and findings appear in the app. Eligible stroke corrections normalize only the identified likely cut strokes to `#000000` and `0.001in`; eligible artboard corrections set the assignment page size without scaling or moving the artwork. “Ready for teacher review” only means that the automated profile checks found no blockers. An instructor must still inspect the file, material, machine settings, ventilation, focus, placement, and supervision requirements.
+The app never changes the uploaded original, sets laser power/speed, or certifies that a job is safe to run. When the analyzer offers a correction, one click downloads a separate corrected SVG and immediately runs that copy through the full review again so its updated preview and findings appear in the app. Eligible stroke corrections normalize only the identified likely cut strokes to `#000000` and `0.001in`; eligible artboard corrections cap only oversized page axes without scaling or moving the artwork. “Ready for teacher review” only means that the automated profile checks found no blockers. An instructor must still inspect the file, material, machine settings, ventilation, focus, placement, and supervision requirements.
 
 ## Privacy and security
 
@@ -27,16 +27,16 @@ The app never changes the uploaded original, sets laser power/speed, or certifie
 
 Deploying a public Space sends files to Hugging Face infrastructure for transient processing. Confirm that this is compatible with school policy before inviting students to use it.
 
-## Version 1.2 scope
+## Version 1.3 scope
 
 - SVG is the only accepted file format, with Adobe Illustrator exports as the primary target.
-- Classroom assignments use a 12 x 12 inch default artboard, and student-facing measurements default to inches.
+- Classroom assignments allow artboards up to 12 x 12 inches by default. Smaller artboards pass; only an oversized width or height is blocked. A safe one-click correction caps only the oversized axes, preserves the physical artwork scale and top-left/viewBox origin, then immediately re-reviews the corrected copy.
 - The configured through-cut target remains exactly `0.001in`. To accommodate Illustrator SVG export rounding observed in classroom files, the demo profile accepts physical cut strokes from `0.00070in` through approximately `0.00102in`; the lower and upper tolerances are configured separately in the lab profile.
 - The uploaded original is read-only. A one-click stroke correction downloads a separate SVG containing only analyzer-identified likely cut-stroke normalization to pure RGB black (`#000000`) and `0.001in`, then immediately analyzes and previews that corrected copy. Automatic correction is limited to plausible cut widths up to `0.010in` and is disabled for documents with shared `<use>` geometry, CSS priorities, ambiguous transforms, unsafe effects, or unresolved resources so intentional engraving is not silently converted.
-- For exact-size assignments, an eligible one-click artboard correction downloads a separate SVG and immediately re-reviews it. The corrected artboard is anchored at the existing top-left/viewBox origin and preserves the artwork's physical scale and coordinates; making a page smaller can therefore reveal out-of-page artwork. The fix is conservatively withheld when viewport mapping or geometry cannot be proven stable.
-- Embedded raster images can appear in the sanitized 2D preview as multiply-blended layers. Linked images remain blocked because their pixel data is absent from the SVG.
+- Embedded raster images appear as multiply-blended layers in both the sanitized 2D preview and on inferred cut-piece surfaces in 3D. Linked images remain blocked because their pixel data is absent from the SVG.
+- A Weak points toggle displays bounded, normalized estimates for narrow features, close cut spacing, and tiny loose pieces in both 2D and 3D. The analyzer returns exact measured spans or representative locations plus the selected material guideline. Heat density remains a document-wide warning rather than receiving a fabricated marker, and partial/unavailable scans are labeled explicitly.
 - Packing/nesting is intentionally deferred. A future packer must preserve the original and export a separate packed SVG.
-- The 3D view is an approximate inspection aid; it cannot infer keep-versus-scrap, assembly intent, charring, or real strength.
+- The 3D view and weak-point overlay are approximate inspection aids; they cannot infer keep-versus-scrap, grain direction, material defects, assembly intent, charring, or real strength.
 - PDF and DXF can be added later as parser adapters behind the same normalized report format.
 
 ## Lab profile
@@ -44,7 +44,7 @@ Deploying a public Space sends files to Hugging Face infrastructure for transien
 Rules live in `config/lab-profile.yaml`. The checked-in profile is intentionally marked `demo: true`; it provides realistic examples but cannot return a production “Ready for teacher review” result. Before classroom use:
 
 1. Enter the exact usable bed dimensions and margins for the lab's Epilog machine.
-2. Confirm the 12 x 12 inch classroom assignment default, process colors, and accepted stroke widths against the lab workflow.
+2. Confirm the 12 x 12 inch classroom assignment maximum, process colors, and accepted stroke widths against the lab workflow.
 3. Replace example materials with approved products and verified thickness, kerf, bridge, spacing, and loose-piece thresholds.
 4. Set `demo: false` only after testing at least one known-good and one known-bad Illustrator export against the physical lab workflow.
 
@@ -113,7 +113,7 @@ In PowerShell, set the environment variable with `$env:LASER_REVIEWER_FRONTEND_D
 - `GET /api/v1/profile` — public machine, assignment, and material choices.
 - `POST /api/v1/analyze` — multipart SVG analysis with assignment, material, and thickness selections.
 - `POST /api/v1/fix-strokes` — multipart, stateless generation of a separate corrected SVG for analyzer-identified cut strokes. The uploaded original is unchanged.
-- `POST /api/v1/fix-artboard` — multipart, stateless generation of a separate SVG with the exact assignment artboard while preserving verified physical artwork geometry. The uploaded original is unchanged.
+- `POST /api/v1/fix-artboard` — multipart, stateless generation of a separate SVG that applies the assignment artboard target or caps oversized axes at its maximum while preserving verified physical artwork geometry. The uploaded original is unchanged.
 
 The analysis API returns normalized, sanitized geometry and a versioned report. Valid embedded images are returned only as safely re-encoded preview data, while linked images are never fetched. Uploaded source markup is not echoed into the page.
 

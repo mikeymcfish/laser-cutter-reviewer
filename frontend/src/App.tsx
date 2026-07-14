@@ -4,9 +4,9 @@ import { Checklist } from './components/Checklist'
 import { CubeIcon, DownloadIcon, InfoIcon, ResetIcon, SparkIcon, WarningIcon } from './components/Icons'
 import { Preview2D } from './components/Preview2D'
 import { UploadPanel } from './components/UploadPanel'
-import type { AnalysisCheck, AnalysisReport, CheckStatus, FixAction, Material, ProfileResponse } from './types'
+import type { AnalysisCheck, AnalysisReport, CheckStatus, FixAction, Material, PreviewWeakPoint, ProfileResponse } from './types'
 import { checkKey, checkStatus, displayName, materialThicknesses } from './types'
-import { formatDimensionsInches, formatInches } from './units'
+import { formatDimensionsInches, formatInches, formatSquareInches } from './units'
 
 const defaultOperatorChecks = [
   'Material is instructor-approved and its SDS has been reviewed.',
@@ -50,6 +50,12 @@ const metricValue = (value: unknown, suffix = '') => {
   return `${String(value)}${suffix}`
 }
 
+const weakPointEvidence = (point: PreviewWeakPoint) => (
+  point.unit === 'mm2'
+    ? `${formatSquareInches(point.measurement)} area · guideline ${formatSquareInches(point.threshold)}`
+    : `${formatInches(point.measurement, 4)} · guideline ${formatInches(point.threshold, 4)}`
+)
+
 const fileSizeLabel = (bytes: number) => {
   if (!Number.isFinite(bytes)) return 'the configured limit'
   if (bytes < 1024) return `${bytes} B`
@@ -76,6 +82,7 @@ export default function App() {
   const [report, setReport] = useState<AnalysisReport | null>(null)
   const [selectedCheck, setSelectedCheck] = useState<AnalysisCheck | undefined>()
   const [viewMode, setViewMode] = useState<ViewMode>('2d')
+  const [showWeakPoints, setShowWeakPoints] = useState(false)
   const [manualState, setManualState] = useState<Record<number, boolean>>({})
   const [fixingActionId, setFixingActionId] = useState<string | null>(null)
   const [fixError, setFixError] = useState('')
@@ -145,6 +152,7 @@ export default function App() {
     setAnalysisError('')
     setManualState({})
     setViewMode('2d')
+    setShowWeakPoints(false)
     setFixingActionId(null)
     setFixError('')
     setFixMessage('')
@@ -201,6 +209,7 @@ export default function App() {
       setReport(result)
       setManualState({})
       setViewMode('2d')
+      setShowWeakPoints(false)
       window.requestAnimationFrame(() => document.getElementById('review-results')?.focus())
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return
@@ -211,6 +220,9 @@ export default function App() {
   }
 
   const counts = report ? countChecks(report.checks) : null
+  const weakPoints = report?.geometry.weak_points?.points ?? []
+  const weakPointStatus = report?.geometry.weak_points?.status ?? 'complete'
+  const weakPointMessage = report?.geometry.weak_points?.message
   const demoProfile = Boolean(report?.profile.demo ?? profileData?.profile.demo)
   const hasBlockers = Boolean(counts && counts.blocker > 0)
   const reportReady = Boolean(
@@ -253,6 +265,11 @@ export default function App() {
       manualLabels.map((label, index) => ({ label, checked: Boolean(manualState[index]) })),
       reportReady,
     )
+  }
+
+  const onSelectCheck = (check: AnalysisCheck) => {
+    setSelectedCheck(check)
+    if (check.rule_id === 'material.fragility' && weakPoints.length > 0) setShowWeakPoints(true)
   }
 
   const onFixAction = async (action: FixAction) => {
@@ -322,6 +339,7 @@ export default function App() {
       setSelectedCheck(undefined)
       setManualState({})
       setViewMode('2d')
+      setShowWeakPoints(false)
       setAnalysisError('')
       const changeLabel = action.kind === 'set_artboard' ? 'Artboard fixed' : 'Through-cut strokes fixed'
       setFixMessage(`${changeLabel}. ${nextName} was downloaded and the corrected copy is now shown in the preview.`)
@@ -475,8 +493,22 @@ export default function App() {
                       <span className="eyebrow">Visual inspection</span>
                       <h2 id="preview-title">Your file</h2>
                     </div>
-                    <div className="view-toggle" aria-label="Preview mode">
+                    <div className="view-toggle" aria-label="Preview and overlay controls">
                       <button type="button" className={viewMode === '2d' ? 'is-active' : ''} aria-pressed={viewMode === '2d'} onClick={() => setViewMode('2d')}>2D paths</button>
+                      <button
+                        type="button"
+                        className={showWeakPoints ? 'is-active weak-view-button' : 'weak-view-button'}
+                        aria-pressed={showWeakPoints}
+                        onClick={() => setShowWeakPoints((current) => !current)}
+                        disabled={weakPoints.length === 0}
+                        title={
+                          weakPoints.length
+                            ? `Show ${weakPoints.length} material-dependent weak-point estimate${weakPoints.length === 1 ? '' : 's'}`
+                            : weakPointStatus === 'partial' || weakPointStatus === 'unavailable'
+                              ? weakPointMessage || 'Weak-point locations could not be fully verified.'
+                              : 'No localized weak points fall below the selected material guidelines.'
+                        }
+                      ><WarningIcon size={14} /> Weak points{weakPoints.length ? ` (${weakPoints.length})` : ''}</button>
                       <button
                         type="button"
                         className={viewMode === '3d' ? 'is-active' : ''}
@@ -487,9 +519,7 @@ export default function App() {
                       ><CubeIcon size={15} /> 3D material</button>
                     </div>
                   </div>
-                  {viewMode === '2d' ? (
-                    <Preview2D geometry={report.geometry} selectedCheck={selectedCheck} />
-                  ) : (
+                  {viewMode === '3d' ? (
                     <Suspense fallback={<div className="preview-unavailable"><p>Preparing the 3D material preview…</p></div>}>
                       <Preview3D
                         geometry={report.geometry}
@@ -497,13 +527,32 @@ export default function App() {
                         thicknessMm={reportThickness}
                         kerfMm={kerfMm}
                         previewAppearance={selectedMaterial?.preview}
+                        showWeakPoints={showWeakPoints}
                       />
                     </Suspense>
-                  )}
+                  ) : <Preview2D geometry={report.geometry} selectedCheck={selectedCheck} showWeakPoints={showWeakPoints} />}
+                  {showWeakPoints && weakPoints.length ? (
+                    <div className="weak-point-summary" role="status">
+                      <div><WarningIcon size={16} /><span><b>Potential weak points</b>{weakPointMessage}</span></div>
+                      <ol>
+                        {weakPoints.slice(0, 8).map((point, index) => (
+                          <li key={point.id}>
+                            <i style={{ background: point.kind === 'tiny_piece' ? '#8b4ac7' : point.kind === 'close_cut_spacing' ? '#db7a16' : '#d44d38' }}>{index + 1}</i>
+                            <span><b>{point.label}</b>{weakPointEvidence(point)}</span>
+                          </li>
+                        ))}
+                      </ol>
+                      {weakPoints.length > 8 ? <p>Showing measurements for 8 of {weakPoints.length} markers. The viewer displays all returned locations.</p> : null}
+                      <p>Marker numbers match the 2D view; localized markers remain visible in both views.</p>
+                    </div>
+                  ) : null}
                   {!report.geometry.valid_3d ? (
                     <div className="three-disabled-note"><InfoIcon size={16} /><span><b>3D preview unavailable:</b> {report.geometry.invalid_reason || 'Fix invalid cut topology first.'}</span></div>
                   ) : null}
-                  <p className="preview-disclaimer">Preview is approximate. Embedded images are sanitized and shown as multiply layers; live text is shown only as bounds. Keep vs. scrap, assembly, charring, and physical strength cannot be inferred.</p>
+                  {report.geometry.weak_points && weakPointStatus !== 'complete' ? (
+                    <div className="three-disabled-note"><WarningIcon size={16} /><span><b>Weak-point scan {weakPointStatus}:</b> {weakPointMessage}</span></div>
+                  ) : null}
+                  <p className="preview-disclaimer">Preview is approximate. Embedded images are sanitized and shown as multiply layers; weak-point markers are material-guideline estimates, not strength predictions. Keep vs. scrap, assembly, and charring cannot be inferred.</p>
                 </section>
 
                 <section className="metrics-panel" aria-labelledby="metrics-title">
@@ -516,7 +565,7 @@ export default function App() {
                     <div><dt>Objects</dt><dd>{metricValue(report.metrics.object_count ?? report.geometry.paths.length)}</dd></div>
                     <div><dt>Cut length</dt><dd>{formatInches(report.metrics.total_cut_length_mm, 2)}</dd></div>
                     <div><dt>Raster images</dt><dd>{metricValue(report.metrics.image_count ?? 0)}</dd></div>
-                    <div><dt>Smallest feature</dt><dd>{formatInches(report.metrics.minimum_feature_mm ?? report.metrics.smallest_estimated_feature_mm)}</dd></div>
+                    <div><dt>Weak points</dt><dd>{weakPoints.length ? `${weakPoints.length} flagged · ${formatInches(report.metrics.minimum_feature_mm ?? report.metrics.smallest_estimated_feature_mm)} minimum` : weakPointStatus === 'complete' ? `None flagged · ${formatInches(report.metrics.minimum_feature_mm ?? report.metrics.smallest_estimated_feature_mm)} minimum` : 'Not fully verified'}</dd></div>
                     <div><dt>Material</dt><dd>{report.selection.material_label ?? displayName(selectedMaterial ?? { id: materialId })}</dd></div>
                     <div><dt>Kerf estimate</dt><dd>{formatInches(kerfMm)}</dd></div>
                   </dl>
@@ -546,7 +595,7 @@ export default function App() {
               <Checklist
                 checks={report.checks}
                 selectedId={selectedCheck ? checkKey(selectedCheck) : null}
-                onSelect={setSelectedCheck}
+                onSelect={onSelectCheck}
                 onFixAction={onFixAction}
                 fixingActionId={fixingActionId}
               />

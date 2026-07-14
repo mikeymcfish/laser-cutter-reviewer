@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import { findingEvidenceText, reportFileFacts } from './report'
+import { rasterPlacement } from './rasterPlacement'
 import type { AnalysisReport } from './types'
 
 const report: AnalysisReport = {
-  report_version: '1.2',
+  report_version: '1.3',
   analyzed_at: '2026-07-14T14:30:00Z',
   file: { name: 'student.svg', size_bytes: 512, sha256: 'a'.repeat(64) },
   profile: { id: 'classroom', name: 'Classroom', version: '1.0.0', demo: false },
@@ -41,5 +42,26 @@ describe('PDF report content', () => {
       'Stroke: 0.04 mm · Expected: 0.0254 mm',
     )
     expect(findingEvidenceText([])).toBe('No measured evidence was reported.')
+  })
+
+  it('places PDF raster thumbnails in their local viewport for meet, slice, and alignment', () => {
+    expect(rasterPlacement(100, 100, 2, 'xMaxYMin meet')).toEqual({
+      x: 0.5,
+      y: 0,
+      width: 0.5,
+      height: 1,
+    })
+    expect(rasterPlacement(100, 100, 2, 'xMidYMax slice')).toEqual({
+      x: 0,
+      y: -1,
+      width: 1,
+      height: 2,
+    })
+    expect(rasterPlacement(400, 100, 2, 'xMinYMid slice')).toEqual({
+      x: 0,
+      y: 0,
+      width: 2,
+      height: 1,
+    })
   })
 })

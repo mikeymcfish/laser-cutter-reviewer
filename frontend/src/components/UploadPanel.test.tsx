@@ -7,7 +7,7 @@ const baseProps = {
     id: 'intro',
     name: 'Intro',
     description: 'Use the classroom square artboard.',
-    page_policy: 'exact',
+    page_policy: 'fit_within',
     expected_width_mm: 304.8,
     expected_height_mm: 304.8,
   }],
@@ -34,7 +34,7 @@ describe('UploadPanel', () => {
 
   it('shows profile-driven artboard and thickness requirements in inches', () => {
     render(<UploadPanel {...baseProps} />)
-    expect(screen.getByText('Required artboard: 12 × 12 in')).toBeInTheDocument()
+    expect(screen.getByText('Maximum artboard: 12 × 12 in')).toBeInTheDocument()
     expect(screen.getByText('Use the classroom square artboard.')).toBeInTheDocument()
     expect(screen.getByRole('option', { name: '0.118 in' })).toBeInTheDocument()
   })

@@ -13,7 +13,7 @@ from pydantic import ValidationError
 
 from backend import main as main_module
 from backend.main import AggregateRequestLimitMiddleware
-from backend.models import LabProfile, PreviewRasterLayer, ProcessProfile
+from backend.models import LabProfile, PreviewRasterLayer, PreviewWeakPoint, ProcessProfile, WeakPointPreview
 from backend.profile import load_profile, public_profile
 from backend.svg_analyzer import _safe_png_preview, analyze_svg
 
@@ -248,6 +248,7 @@ def test_raster_layer_accepts_only_normalized_aspect_ratio_contract(value):
         z_index=0,
         corners_mm=[[0, 0], [1, 0], [1, 1], [0, 1]],
         preserve_aspect_ratio=value,
+        viewport_aspect_ratio=1,
     )
     assert layer.preserve_aspect_ratio == value
 
@@ -261,6 +262,7 @@ def test_raster_layer_rejects_non_normalized_aspect_ratio_values(value):
             z_index=0,
             corners_mm=[[0, 0], [1, 0], [1, 1], [0, 1]],
             preserve_aspect_ratio=value,
+            viewport_aspect_ratio=1,
         )
 
 
@@ -272,6 +274,19 @@ def test_raster_layer_z_index_is_required_nonnegative_strict_integer(z_index):
             asset_id="asset",
             z_index=z_index,
             corners_mm=[[0, 0], [1, 0], [1, 1], [0, 1]],
+            viewport_aspect_ratio=1,
+        )
+
+
+@pytest.mark.parametrize("viewport_aspect_ratio", [0, -1, float("nan"), float("inf")])
+def test_raster_layer_requires_finite_positive_local_viewport_aspect(viewport_aspect_ratio):
+    with pytest.raises(ValidationError):
+        PreviewRasterLayer(
+            id="layer",
+            asset_id="asset",
+            z_index=0,
+            corners_mm=[[0, 0], [2, 0], [2, 1], [0, 1]],
+            viewport_aspect_ratio=viewport_aspect_ratio,
         )
 
 
@@ -308,6 +323,75 @@ def test_core_profile_validation_rejects_invalid_configuration(mutate):
     mutate(data)
     with pytest.raises(ValidationError):
         LabProfile.model_validate(data)
+
+
+def test_historical_exact_page_policy_remains_valid():
+    data = load_profile().model_dump()
+    data["assignments"][0]["page_policy"] = "exact"
+    validated = LabProfile.model_validate(data)
+    assert validated.assignments[0].page_policy == "exact"
+    assert validated.assignments[0].expected_width_mm == pytest.approx(304.8)
+    assert validated.assignments[0].expected_height_mm == pytest.approx(304.8)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "id": "nan",
+            "kind": "narrow_feature",
+            "label": "Narrow feature",
+            "object_ids": ["part"],
+            "location_mm": [float("nan"), 1],
+            "span_mm": [[0, 0], [1, 1]],
+            "measurement": 1,
+            "threshold": 2,
+            "unit": "mm",
+        },
+        {
+            "id": "missing-span",
+            "kind": "narrow_feature",
+            "label": "Narrow feature",
+            "object_ids": ["part"],
+            "location_mm": [1, 1],
+            "measurement": 1,
+            "threshold": 2,
+            "unit": "mm",
+        },
+        {
+            "id": "one-sided-gap",
+            "kind": "close_cut_spacing",
+            "label": "Close cut spacing",
+            "object_ids": ["part"],
+            "location_mm": [1, 1],
+            "span_mm": [[0, 0], [1, 1]],
+            "measurement": 1,
+            "threshold": 2,
+            "unit": "mm",
+        },
+    ],
+)
+def test_weak_point_model_rejects_unsafe_or_inconsistent_locations(payload):
+    with pytest.raises(ValidationError):
+        PreviewWeakPoint.model_validate(payload)
+
+
+def test_unavailable_weak_point_scan_rejects_localized_points():
+    point = PreviewWeakPoint(
+        id="weak-point-0001",
+        kind="tiny_piece",
+        label="Tiny piece",
+        object_ids=["part"],
+        location_mm=(1, 1),
+        measurement=1,
+        threshold=2,
+        unit="mm2",
+    )
+    with pytest.raises(ValidationError):
+        WeakPointPreview(status="unavailable", message="Unavailable", points=[point])
+
+    with pytest.raises(ValidationError):
+        WeakPointPreview(status="partial", message="Bounded", points=[point] * 201)
 
 
 def test_open_score_process_is_approved_but_not_used_as_cut_topology():

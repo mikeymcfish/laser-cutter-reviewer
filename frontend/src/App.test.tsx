@@ -26,7 +26,7 @@ const profile: ProfileResponse = {
       id: 'intro-svg',
       name: 'Intro laser-cutting project',
       description: 'Black vector cuts.',
-      page_policy: 'exact',
+      page_policy: 'fit_within',
       expected_width_mm: 304.8,
       expected_height_mm: 304.8,
     },
@@ -40,7 +40,7 @@ const profile: ProfileResponse = {
 }
 
 const report: AnalysisReport = {
-  report_version: '1.2',
+  report_version: '1.3',
   analyzed_at: '2026-07-14T14:30:00Z',
   file: { name: 'student.svg', size_bytes: 120, sha256: 'a'.repeat(64) },
   profile: { id: 'demo', name: 'Classroom', version: '1.0.0', demo: false },
@@ -85,6 +85,11 @@ const report: AnalysisReport = {
       { id: 'path-closed', z_index: 1, operation: 'cut', closed: true, stroke: '#000000', points: [[80, 40], [110, 40], [110, 70], [80, 70]] },
     ],
     pieces: [],
+    weak_points: {
+      status: 'complete',
+      message: 'No potential weak points fell below the selected material guidelines.',
+      points: [],
+    },
     valid_3d: false,
     invalid_reason: 'Open cut lines must be fixed before extrusion.',
   },
@@ -132,7 +137,7 @@ describe('Laser Ready app', () => {
   it('presents the profile-driven artboard and analyzed measurements in inches', async () => {
     const user = userEvent.setup()
     const { container } = render(<App />)
-    expect(await screen.findByText('Required artboard: 12 × 12 in')).toBeInTheDocument()
+    expect(await screen.findByText('Maximum artboard: 12 × 12 in')).toBeInTheDocument()
     expect(screen.getByRole('option', { name: '0.118 in' })).toBeInTheDocument()
 
     await user.upload(
@@ -144,9 +149,64 @@ describe('Laser Ready app', () => {
 
     expect(screen.getAllByText('12 × 12 in').length).toBeGreaterThan(0)
     expect(screen.getByText('8.27 in')).toBeInTheDocument()
-    expect(screen.getByText('0.047 in')).toBeInTheDocument()
+    expect(screen.getByText(/None flagged · 0.047 in minimum/)).toBeInTheDocument()
     expect(screen.getByText('0.007 in')).toBeInTheDocument()
     expect(screen.queryByText(/\bmm\b/i)).not.toBeInTheDocument()
+  })
+
+  it('shows measured potential weak points and opens the overlay from the fragility finding', async () => {
+    const user = userEvent.setup()
+    const weakReport: AnalysisReport = {
+      ...report,
+      summary: { status: 'not_ready', counts: { blocker: 0, warning: 1, pass: 0, info: 0, unverified: 0 } },
+      checks: [{
+        rule_id: 'material.fragility',
+        title: 'Estimated feature strength and spacing',
+        state: 'warning',
+        message: 'Potential weak points need instructor review.',
+        evidence: ['Narrow feature: 0.04 in'],
+        object_ids: ['path-closed'],
+      }],
+      geometry: {
+        ...report.geometry,
+        weak_points: {
+          status: 'complete',
+          message: 'Showing one potential weak-point estimate.',
+          points: [{
+            id: 'weak-point-0001',
+            kind: 'narrow_feature',
+            label: 'Narrow feature',
+            object_ids: ['path-closed'],
+            location_mm: [95, 55],
+            span_mm: [[95, 54.5], [95, 55.5]],
+            measurement: 1,
+            threshold: 1.5,
+            unit: 'mm',
+          }],
+        },
+      },
+    }
+    vi.mocked(api.analyzeSvg).mockResolvedValue(weakReport)
+    const { container } = render(<App />)
+    await screen.findByText('Tell us what you’re making')
+    await user.upload(
+      container.querySelector<HTMLInputElement>('input[type="file"]')!,
+      new File(['<svg/>'], 'weak.svg', { type: 'image/svg+xml' }),
+    )
+    await user.click(screen.getByRole('button', { name: 'Review my file' }))
+
+    const toggle = await screen.findByRole('button', { name: 'Weak points (1)' })
+    expect(toggle).toHaveAttribute('aria-pressed', 'false')
+    await user.click(screen.getByRole('button', { name: /Estimated feature strength and spacing/ }))
+    expect(toggle).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('img', { name: /1 potential weak point highlighted/ })).toBeInTheDocument()
+    expect(container.querySelectorAll('[data-weak-point]')).toHaveLength(1)
+    expect(container.querySelector('.weak-point-summary li i')).toHaveTextContent('1')
+    expect(screen.getByText(/Marker numbers match the 2D view/)).toBeInTheDocument()
+
+    await user.click(toggle)
+    expect(toggle).toHaveAttribute('aria-pressed', 'false')
+    expect(container.querySelector('[data-testid="weak-point-layer"]')).toBeNull()
   })
 
   it('fixes through-cut strokes, downloads the copy, and refreshes the preview in one click', async () => {
@@ -231,7 +291,7 @@ describe('Laser Ready app', () => {
     }
   })
 
-  it('fixes only the artboard and immediately shows the refreshed 12 by 12 preview', async () => {
+  it('caps only the oversized artboard axis and immediately refreshes the preview', async () => {
     const user = userEvent.setup()
     const action: FixAction = {
       id: 'set-artboard',
@@ -242,17 +302,17 @@ describe('Laser Ready app', () => {
       object_ids: [],
       count: 1,
       target_width_in: 12,
-      target_height_in: 12,
+      target_height_in: 8,
     }
     const initialReport: AnalysisReport = {
       ...report,
-      document: { ...report.document, width_mm: 210, height_mm: 297 },
-      geometry: { ...report.geometry, page: { width_mm: 210, height_mm: 297 } },
+      document: { ...report.document, width_mm: 330.2, height_mm: 203.2 },
+      geometry: { ...report.geometry, page: { width_mm: 330.2, height_mm: 203.2 } },
       checks: [{
         rule_id: 'document.size',
         title: 'Artboard size',
         state: 'blocker',
-        message: 'The artboard does not match the assignment.',
+        message: 'The artboard is larger than the assignment allows.',
         object_ids: [],
         bounds: [],
         fix_actions: [action],
@@ -261,9 +321,10 @@ describe('Laser Ready app', () => {
     const refreshedReport: AnalysisReport = {
       ...report,
       file: { ...report.file, name: 'student-artboard-fixed.svg', sha256: 'b'.repeat(64) },
+      document: { ...report.document, width_mm: 304.8, height_mm: 203.2 },
       summary: { status: 'ready', counts: { blocker: 0, warning: 0, pass: 1, info: 0, unverified: 0 } },
       checks: [{ ...report.checks[2], state: 'pass' }],
-      geometry: { ...report.geometry, page: { width_mm: 304.8, height_mm: 304.8 } },
+      geometry: { ...report.geometry, page: { width_mm: 304.8, height_mm: 203.2 } },
     }
     vi.mocked(api.analyzeSvg).mockResolvedValueOnce(initialReport).mockResolvedValueOnce(refreshedReport)
     vi.mocked(api.sha256File).mockResolvedValueOnce('a'.repeat(64)).mockResolvedValueOnce('b'.repeat(64))
@@ -278,13 +339,13 @@ describe('Laser Ready app', () => {
       await user.upload(container.querySelector<HTMLInputElement>('input[type="file"]')!, new File(['<svg/>'], 'student.svg', { type: 'image/svg+xml' }))
       await user.click(screen.getByRole('button', { name: 'Review my file' }))
       await user.click(await screen.findByRole('button', { name: /Artboard size/ }))
-      expect(screen.getByText('Changes the page only to 12 × 12 in')).toBeInTheDocument()
+      expect(screen.getByText('Changes the page only to 12 × 8 in')).toBeInTheDocument()
       expect(screen.getByText(/anchored at the top-left.*not scaled or moved/)).toBeInTheDocument()
-      await user.click(screen.getByRole('button', { name: /Fix artboard page only to 12 × 12 in/ }))
+      await user.click(screen.getByRole('button', { name: /Fix artboard page only to 12 × 8 in/ }))
       expect(await screen.findByText(/Artboard fixed/)).toBeInTheDocument()
       expect(api.fixSvg).toHaveBeenCalledWith(expect.any(File), action, expect.objectContaining({ expectedSha256: 'a'.repeat(64) }))
       expect(api.analyzeSvg).toHaveBeenCalledTimes(2)
-      expect(screen.getAllByText('12 × 12 in').length).toBeGreaterThan(0)
+      expect(screen.getAllByText('12 × 8 in').length).toBeGreaterThan(0)
       expect(screen.getAllByText('student-artboard-fixed.svg').length).toBeGreaterThan(0)
       expect((click.mock.instances[0] as unknown as HTMLAnchorElement).download).toBe('student-artboard-fixed.svg')
     } finally {

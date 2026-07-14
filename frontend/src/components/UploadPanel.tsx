@@ -49,7 +49,7 @@ export function UploadPanel({
   const assignment = assignments.find((item) => item.id === assignmentId)
   const material = materials.find((item) => item.id === materialId)
   const thicknesses = materialThicknesses(material)
-  const exactArtboard = assignment?.page_policy === 'exact'
+  const sizedArtboard = (assignment?.page_policy === 'exact' || assignment?.page_policy === 'fit_within')
     && assignment.expected_width_mm != null
     && assignment.expected_height_mm != null
 
@@ -114,10 +114,12 @@ export function UploadPanel({
         </label>
       </div>
 
-      {assignment?.description || exactArtboard ? (
+      {assignment?.description || sizedArtboard ? (
         <div className="assignment-note" aria-live="polite">
           <div>
-            <strong>{exactArtboard ? `Required artboard: ${formatDimensionsInches(assignment.expected_width_mm, assignment.expected_height_mm)}` : 'Assignment note'}</strong>
+            <strong>{sizedArtboard
+              ? `${assignment.page_policy === 'fit_within' ? 'Maximum' : 'Required'} artboard: ${formatDimensionsInches(assignment.expected_width_mm, assignment.expected_height_mm)}`
+              : 'Assignment note'}</strong>
             {assignment.description ? <span>{assignment.description}</span> : null}
           </div>
         </div>

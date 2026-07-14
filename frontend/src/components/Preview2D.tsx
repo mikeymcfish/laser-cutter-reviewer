@@ -6,11 +6,15 @@ import type {
   PreviewPath,
   PreviewRasterAsset,
   PreviewRasterLayer,
+  PreviewWeakPoint,
 } from '../types'
+import { rasterPlacement } from '../rasterPlacement'
+import { formatInches, formatSquareInches } from '../units'
 
 interface Preview2DProps {
   geometry: PreviewGeometry
   selectedCheck?: AnalysisCheck
+  showWeakPoints?: boolean
 }
 
 interface RenderableRasterLayer {
@@ -46,17 +50,39 @@ const affineTransform = (corners: Point[]) => {
   return `matrix(${topRight[0] - topLeft[0]} ${topRight[1] - topLeft[1]} ${bottomLeft[0] - topLeft[0]} ${bottomLeft[1] - topLeft[1]} ${topLeft[0]} ${topLeft[1]})`
 }
 
-const preserveAspectRatio = (value: string) => (
-  /^(?:none|x(?:Min|Mid|Max)Y(?:Min|Mid|Max) (?:meet|slice))$/.test(value)
-    ? value
-    : 'xMidYMid meet'
+const finitePoint = (point: Point | undefined): point is Point => (
+  Boolean(point) && point!.length === 2 && point!.every((value) => Number.isFinite(value))
 )
 
-export function Preview2D({ geometry, selectedCheck }: Preview2DProps) {
+const validWeakPoint = (point: PreviewWeakPoint) => (
+  finitePoint(point.location_mm)
+  && Number.isFinite(point.measurement)
+  && Number.isFinite(point.threshold)
+  && point.measurement >= 0
+  && point.threshold > 0
+  && (!point.span_mm || (point.span_mm.length === 2 && point.span_mm.every(finitePoint)))
+)
+
+const weakPointColor = (kind: PreviewWeakPoint['kind']) => {
+  if (kind === 'tiny_piece') return '#8b4ac7'
+  if (kind === 'close_cut_spacing') return '#db7a16'
+  return '#d44d38'
+}
+
+const weakPointMeasurement = (point: PreviewWeakPoint) => (
+  point.unit === 'mm2'
+    ? `${formatSquareInches(point.measurement)}; guideline ${formatSquareInches(point.threshold)}`
+    : `${formatInches(point.measurement, 4)}; guideline ${formatInches(point.threshold, 4)}`
+)
+
+export function Preview2D({ geometry, selectedCheck, showWeakPoints = false }: Preview2DProps) {
   const patternId = useId().replaceAll(':', '')
   const width = Number(geometry.page?.width_mm) || 1
   const height = Number(geometry.page?.height_mm) || 1
   const selectedIds = new Set(selectedCheck?.object_ids ?? [])
+  const weakPoints = (geometry.weak_points?.points ?? []).filter(validWeakPoint)
+  const weakObjectIds = new Set(weakPoints.flatMap((point) => point.object_ids))
+  const weakPointLayerVisible = showWeakPoints && weakPoints.length > 0
   const rasterLayers = useMemo<RenderableRasterLayer[]>(() => {
     const assets = new Map(
       (geometry.raster_assets ?? [])
@@ -96,7 +122,7 @@ export function Preview2D({ geometry, selectedCheck }: Preview2DProps) {
     <div
       className="preview-2d"
       role="img"
-      aria-label={`Normalized two-dimensional preview of the submitted cut file${rasterLayers.length ? ` with ${rasterLayers.length} embedded raster image ${rasterLayers.length === 1 ? 'layer' : 'layers'}` : ''}`}
+      aria-label={`Normalized two-dimensional preview of the submitted cut file${rasterLayers.length ? ` with ${rasterLayers.length} embedded raster image ${rasterLayers.length === 1 ? 'layer' : 'layers'}` : ''}${weakPointLayerVisible ? ` and ${weakPoints.length} potential weak ${weakPoints.length === 1 ? 'point' : 'points'} highlighted` : ''}`}
     >
       <svg viewBox={`${-width * 0.035} ${-height * 0.035} ${width * 1.07} ${height * 1.07}`} preserveAspectRatio="xMidYMid meet">
         <defs>
@@ -115,19 +141,31 @@ export function Preview2D({ geometry, selectedCheck }: Preview2DProps) {
               const { layer, asset } = renderLayer.raster
               const selected = selectedIds.has(layer.id)
               const configuredOpacity = Number.isFinite(layer.opacity) ? Math.min(1, Math.max(0, layer.opacity)) : 1
+              const placement = rasterPlacement(
+                Number(asset.preview_width_px) || Number(asset.pixel_width) || 1,
+                Number(asset.preview_height_px) || Number(asset.pixel_height) || 1,
+                layer.viewport_aspect_ratio,
+                layer.preserve_aspect_ratio,
+              )
               return (
                 <image
                   key={`raster-${layer.id}`}
                   data-raster-layer={layer.id}
                   data-preview-layer={`raster:${layer.id}`}
                   href={asset.data_url}
-                  x="0"
-                  y="0"
-                  width="1"
-                  height="1"
-                  preserveAspectRatio={preserveAspectRatio(layer.preserve_aspect_ratio)}
+                  x={placement.x}
+                  y={placement.y}
+                  width={placement.width}
+                  height={placement.height}
+                  preserveAspectRatio="none"
                   transform={affineTransform(layer.corners_mm)}
-                  opacity={selectedIds.size > 0 && !selected ? configuredOpacity * 0.2 : configuredOpacity}
+                  opacity={
+                    selectedIds.size > 0 && !selected
+                      ? configuredOpacity * 0.2
+                      : weakPointLayerVisible && !weakObjectIds.has(layer.id)
+                        ? configuredOpacity * 0.24
+                        : configuredOpacity
+                  }
                   style={{ mixBlendMode: 'multiply' }}
                   aria-hidden="true"
                 />
@@ -136,16 +174,17 @@ export function Preview2D({ geometry, selectedCheck }: Preview2DProps) {
             const path = renderLayer.path
             if (!path.points?.length) return null
             const selected = selectedIds.has(path.id)
+            const weak = weakPointLayerVisible && weakObjectIds.has(path.id)
             const common = {
               'data-preview-layer': `path:${path.id}`,
               points: pointString(path.points),
               fill: 'none',
-              stroke: selected ? '#2d5bdb' : operationColor(path),
-              strokeWidth: selected ? Math.max(width, height) * 0.006 : Math.max(width, height) * 0.0016,
+              stroke: selected ? '#2d5bdb' : weak ? '#b94b35' : operationColor(path),
+              strokeWidth: selected || weak ? Math.max(width, height) * 0.006 : Math.max(width, height) * 0.0016,
               vectorEffect: 'non-scaling-stroke' as const,
               strokeLinecap: 'round' as const,
               strokeLinejoin: 'round' as const,
-              opacity: selectedIds.size > 0 && !selected ? 0.22 : 0.92,
+              opacity: selectedIds.size > 0 && !selected ? 0.22 : weakPointLayerVisible && !weak ? 0.26 : 0.92,
             }
             return path.closed ? <polygon key={path.id} {...common} /> : <polyline key={path.id} {...common} />
           })}
@@ -206,6 +245,47 @@ export function Preview2D({ geometry, selectedCheck }: Preview2DProps) {
               />
             ))
           : null}
+        {weakPointLayerVisible ? (
+          <g className="weak-point-layer" data-testid="weak-point-layer">
+            {weakPoints.map((point, index) => {
+              const color = weakPointColor(point.kind)
+              const radius = Math.max(width, height) * 0.013
+              return (
+                <g
+                  key={point.id}
+                  data-weak-point={point.id}
+                  transform={`translate(${point.location_mm[0]} ${point.location_mm[1]})`}
+                >
+                  <title>{`${point.label}: ${weakPointMeasurement(point)}`}</title>
+                  {point.span_mm ? (
+                    <line
+                      x1={point.span_mm[0][0] - point.location_mm[0]}
+                      y1={point.span_mm[0][1] - point.location_mm[1]}
+                      x2={point.span_mm[1][0] - point.location_mm[0]}
+                      y2={point.span_mm[1][1] - point.location_mm[1]}
+                      stroke={color}
+                      strokeWidth={Math.max(width, height) * 0.008}
+                      strokeLinecap="round"
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  ) : null}
+                  <circle r={radius * 1.55} fill={`${color}1f`} stroke={color} strokeWidth={radius * 0.2} />
+                  <circle r={radius} fill={color} stroke="#fff" strokeWidth={radius * 0.2} />
+                  <text
+                    x="0"
+                    y={radius * 0.34}
+                    textAnchor="middle"
+                    fontSize={radius * 0.92}
+                    fontWeight="800"
+                    fill="#fff"
+                  >
+                    {index + 1}
+                  </text>
+                </g>
+              )
+            })}
+          </g>
+        ) : null}
       </svg>
       <div className="preview-legend" aria-hidden="true">
         <span><i className="legend-cut" />Cut</span>
@@ -213,6 +293,7 @@ export function Preview2D({ geometry, selectedCheck }: Preview2DProps) {
         <span><i className="legend-engrave" />Engrave</span>
         {rasterLayers.length ? <span><i className="legend-raster" />Embedded image (multiply)</span> : null}
         {selectedCheck ? <span><i className="legend-selected" />Selected finding</span> : null}
+        {weakPointLayerVisible ? <span><i className="legend-weak" />Potential weak point</span> : null}
       </div>
     </div>
   )

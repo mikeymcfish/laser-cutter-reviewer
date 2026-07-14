@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import math
 
 import pytest
 from PIL import Image
@@ -180,7 +181,7 @@ def test_embedded_raster_is_flagged_by_assignment_policy(client):
         base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
     ).decode()
     body = (
-        f'<image id="reference" x="96" y="96" width="96" height="96" '
+        f'<image id="reference" x="96" y="96" width="192" height="96" transform="scale(.5 2)" '
         f'preserveAspectRatio="xMaxYMin slice" href="data:image/png;base64,{png}"/>'
         '<rect id="part" x="96" y="96" width="192" height="192" fill="none" stroke="#000" stroke-width=".096"/>'
     )
@@ -196,7 +197,12 @@ def test_embedded_raster_is_flagged_by_assignment_policy(client):
     assert layers[0]["blend_mode"] == "multiply"
     assert layers[0]["z_index"] == 0
     assert layers[0]["preserve_aspect_ratio"] == "xMaxYMin slice"
+    assert layers[0]["viewport_aspect_ratio"] == pytest.approx(2.0)
     assert len(layers[0]["corners_mm"]) == 4
+    top_left, top_right, _, bottom_left = layers[0]["corners_mm"]
+    transformed_width = math.dist(top_left, top_right)
+    transformed_height = math.dist(top_left, bottom_left)
+    assert transformed_width / transformed_height == pytest.approx(0.5)
     assert assets[0]["data_url"].startswith("data:image/png;base64,")
     assert assets[0]["data_url"] != f"data:image/png;base64,{png}"
     assert assets[0]["preview_width_px"] <= 2048
@@ -259,6 +265,109 @@ def test_tiny_piece_triggers_material_fragility_warning(client):
     fragility = check(report, "material.fragility")
     assert fragility["state"] == "warning"
     assert "tiny" in fragility["object_ids"]
+    weak_points = report["geometry"]["weak_points"]
+    tiny = next(point for point in weak_points["points"] if point["kind"] == "tiny_piece")
+    assert weak_points["status"] == "complete"
+    assert tiny["object_ids"] == ["tiny"]
+    assert tiny["unit"] == "mm2"
+    assert tiny["span_mm"] is None
+    bounds = next(path["bounds"] for path in report["geometry"]["paths"] if path["id"] == "tiny")
+    assert bounds["x_mm"] <= tiny["location_mm"][0] <= bounds["x_mm"] + bounds["width_mm"]
+    assert bounds["y_mm"] <= tiny["location_mm"][1] <= bounds["y_mm"] + bounds["height_mm"]
+
+
+def test_narrow_feature_returns_measured_span(client):
+    data = svg_document(
+        '<rect id="strip" x="96" y="96" width="100" height="4" '
+        'fill="none" stroke="#000" stroke-width=".096"/>'
+    )
+    report = post_svg(client, data).json()
+    point = next(
+        item for item in report["geometry"]["weak_points"]["points"]
+        if item["kind"] == "narrow_feature"
+    )
+    assert check(report, "material.fragility")["state"] == "warning"
+    assert point["object_ids"] == ["strip"]
+    assert point["unit"] == "mm"
+    assert point["measurement"] == pytest.approx(4 * 25.4 / 96, abs=1e-4)
+    assert point["threshold"] == pytest.approx(1.5)
+    assert len(point["span_mm"]) == 2
+
+
+def test_narrow_neck_between_wider_regions_returns_measured_span(client):
+    data = svg_document(
+        '<path id="neck" d="M100 100H140V118H180V100H220V140H180V122H140V140H100Z" '
+        'fill="none" stroke="#000" stroke-width=".096"/>'
+    )
+    report = post_svg(client, data).json()
+    point = next(
+        item for item in report["geometry"]["weak_points"]["points"]
+        if item["kind"] == "narrow_feature"
+    )
+    assert point["object_ids"] == ["neck"]
+    assert point["measurement"] == pytest.approx(4 * 25.4 / 96, abs=1e-4)
+    assert check(report, "material.fragility")["state"] == "warning"
+
+
+def test_close_cut_spacing_returns_shortest_span_for_both_paths(client):
+    data = svg_document(
+        '<rect id="left" x="96" y="96" width="30" height="30" fill="none" stroke="#000" stroke-width=".096"/>'
+        '<rect id="right" x="128" y="96" width="30" height="30" fill="none" stroke="#000" stroke-width=".096"/>'
+    )
+    report = post_svg(client, data).json()
+    point = next(
+        item for item in report["geometry"]["weak_points"]["points"]
+        if item["kind"] == "close_cut_spacing"
+    )
+    assert point["object_ids"] == ["left", "right"]
+    assert point["measurement"] == pytest.approx(2 * 25.4 / 96, abs=1e-4)
+    assert point["threshold"] == pytest.approx(0.6)
+    assert len(point["span_mm"]) == 2
+
+
+def test_safe_geometry_has_complete_empty_weak_point_scan(client, good_svg):
+    report = post_svg(client, good_svg).json()
+    weak_points = report["geometry"]["weak_points"]
+    assert weak_points["status"] == "complete"
+    assert weak_points["points"] == []
+    assert "No potential weak points" in weak_points["message"]
+    assert check(report, "material.fragility")["state"] == "pass"
+
+
+def test_smooth_circle_is_not_mistaken_for_a_narrow_feature(client):
+    data = svg_document(
+        '<circle id="disc" cx="300" cy="300" r="100" '
+        'fill="none" stroke="#000" stroke-width=".096"/>'
+    )
+    report = post_svg(client, data).json()
+    narrow_points = [
+        point for point in report["geometry"]["weak_points"]["points"]
+        if point["kind"] == "narrow_feature"
+    ]
+    assert narrow_points == []
+    assert check(report, "material.fragility")["state"] == "pass"
+
+
+def test_open_path_spacing_is_partial_instead_of_unavailable(client):
+    data = svg_document(
+        '<path id="a" d="M100 100H300" fill="none" stroke="#000" stroke-width=".096"/>'
+        '<path id="b" d="M100 102H300" fill="none" stroke="#000" stroke-width=".096"/>'
+    )
+    report = post_svg(client, data).json()
+    weak_points = report["geometry"]["weak_points"]
+    assert weak_points["status"] == "partial"
+    assert any(point["kind"] == "close_cut_spacing" for point in weak_points["points"])
+
+
+def test_geometry_limit_marks_weak_point_scan_partial(client, monkeypatch):
+    monkeypatch.setattr("backend.svg_analyzer.MAX_PAIRWISE_GEOMETRY_CHECKS", 0)
+    data = svg_document(
+        '<rect id="one" x="96" y="96" width="30" height="30" fill="none" stroke="#000" stroke-width=".096"/>'
+        '<rect id="two" x="128" y="96" width="30" height="30" fill="none" stroke="#000" stroke-width=".096"/>'
+    )
+    report = post_svg(client, data).json()
+    assert report["geometry"]["weak_points"]["status"] == "partial"
+    assert check(report, "material.fragility")["state"] == "unverified"
 
 
 def test_out_of_bounds_effects_and_dashed_cuts(client):

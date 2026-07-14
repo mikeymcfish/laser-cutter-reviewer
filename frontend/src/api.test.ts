@@ -6,7 +6,7 @@ describe('API client', () => {
   afterEach(() => vi.unstubAllGlobals())
 
   it('sends the SVG and all review selections as multipart fields', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ report_version: '1.2' }) })
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ report_version: '1.3' }) })
     vi.stubGlobal('fetch', fetchMock)
     const file = new File(['<svg/>'], 'part.svg', { type: 'image/svg+xml' })
 

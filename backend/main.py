@@ -110,7 +110,7 @@ class AggregateRequestLimitMiddleware:
 
 app = FastAPI(
     title="Laser Cutter Reviewer API",
-    version="1.2.0",
+    version="1.3.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )

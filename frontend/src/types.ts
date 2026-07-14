@@ -213,6 +213,27 @@ export interface PreviewRasterLayer {
   blend_mode: 'multiply'
   z_index: number
   preserve_aspect_ratio: string
+  viewport_aspect_ratio: number
+}
+
+export type PreviewWeakPointKind = 'narrow_feature' | 'close_cut_spacing' | 'tiny_piece'
+
+export interface PreviewWeakPoint {
+  id: string
+  kind: PreviewWeakPointKind
+  label: string
+  object_ids: string[]
+  location_mm: Point
+  span_mm?: [Point, Point] | null
+  measurement: number
+  threshold: number
+  unit: 'mm' | 'mm2'
+}
+
+export interface PreviewWeakPoints {
+  status: 'complete' | 'partial' | 'unavailable'
+  message: string
+  points: PreviewWeakPoint[]
 }
 
 export interface PreviewPiece {
@@ -230,6 +251,7 @@ export interface PreviewGeometry {
   pieces: PreviewPiece[]
   raster_assets?: PreviewRasterAsset[]
   raster_layers?: PreviewRasterLayer[]
+  weak_points?: PreviewWeakPoints
   valid_3d: boolean
   invalid_reason?: string | null
 }

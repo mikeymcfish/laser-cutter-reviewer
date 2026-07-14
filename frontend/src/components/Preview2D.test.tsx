@@ -43,9 +43,9 @@ describe('Preview2D', () => {
             { id: 'svg', data_url: 'data:image/svg+xml;base64,PHN2Zy8+', pixel_width: 1, pixel_height: 1, preview_width_px: 1, preview_height_px: 1 },
           ],
           raster_layers: [
-            { id: 'photo', asset_id: 'safe', corners_mm: [[10, 5], [30, 5], [30, 15], [10, 15]], opacity: 0.8, blend_mode: 'multiply', z_index: 1, preserve_aspect_ratio: 'xMidYMid meet' },
-            { id: 'remote-photo', asset_id: 'remote', corners_mm: [[40, 5], [50, 5], [50, 15], [40, 15]], opacity: 1, blend_mode: 'multiply', z_index: 3, preserve_aspect_ratio: 'xMidYMid meet' },
-            { id: 'svg-photo', asset_id: 'svg', corners_mm: [[55, 5], [65, 5], [65, 15], [55, 15]], opacity: 1, blend_mode: 'multiply', z_index: 4, preserve_aspect_ratio: 'none' },
+            { id: 'photo', asset_id: 'safe', corners_mm: [[10, 5], [30, 5], [30, 15], [10, 15]], opacity: 0.8, blend_mode: 'multiply', z_index: 1, preserve_aspect_ratio: 'xMidYMid meet', viewport_aspect_ratio: 2 },
+            { id: 'remote-photo', asset_id: 'remote', corners_mm: [[40, 5], [50, 5], [50, 15], [40, 15]], opacity: 1, blend_mode: 'multiply', z_index: 3, preserve_aspect_ratio: 'xMidYMid meet', viewport_aspect_ratio: 1 },
+            { id: 'svg-photo', asset_id: 'svg', corners_mm: [[55, 5], [65, 5], [65, 15], [55, 15]], opacity: 1, blend_mode: 'multiply', z_index: 4, preserve_aspect_ratio: 'none', viewport_aspect_ratio: 1 },
           ],
           valid_3d: false,
         }}
@@ -58,7 +58,11 @@ describe('Preview2D', () => {
     expect(images).toHaveLength(1)
     expect(images[0]).toHaveAttribute('href', png)
     expect(images[0]).toHaveAttribute('transform', 'matrix(20 0 0 10 10 5)')
-    expect(images[0]).toHaveAttribute('preserveAspectRatio', 'xMidYMid meet')
+    expect(images[0]).toHaveAttribute('x', '0.25')
+    expect(images[0]).toHaveAttribute('y', '0')
+    expect(images[0]).toHaveAttribute('width', '0.5')
+    expect(images[0]).toHaveAttribute('height', '1')
+    expect(images[0]).toHaveAttribute('preserveAspectRatio', 'none')
     expect(images[0].getAttribute('style')).toContain('mix-blend-mode: multiply')
     expect([...container.querySelectorAll('[data-preview-layer]')].map((node) => node.getAttribute('data-preview-layer'))).toEqual([
       'path:under',
@@ -69,5 +73,56 @@ describe('Preview2D', () => {
     expect(container.innerHTML).not.toContain('image/svg+xml')
     expect(screen.getByText('Embedded image (multiply)')).toBeInTheDocument()
     expect(container.querySelector('foreignObject')).toBeNull()
+  })
+
+  it('toggles finite measured weak-point spans above normalized artwork', () => {
+    const geometry = {
+      page: { width_mm: 100, height_mm: 50 },
+      paths: [
+        { id: 'part', z_index: 0, operation: 'cut', closed: true, points: [[5, 5], [45, 5], [45, 25], [5, 25]] as [number, number][] },
+      ],
+      pieces: [],
+      weak_points: {
+        status: 'complete' as const,
+        message: 'One potential weak point.',
+        points: [
+          {
+            id: 'weak-point-0001',
+            kind: 'narrow_feature' as const,
+            label: 'Narrow feature',
+            object_ids: ['part'],
+            location_mm: [20, 10] as [number, number],
+            span_mm: [[20, 9], [20, 11]] as [[number, number], [number, number]],
+            measurement: 2,
+            threshold: 3,
+            unit: 'mm' as const,
+          },
+          {
+            id: 'invalid',
+            kind: 'tiny_piece' as const,
+            label: 'Invalid marker',
+            object_ids: ['part'],
+            location_mm: [Number.NaN, 10] as [number, number],
+            measurement: 1,
+            threshold: 2,
+            unit: 'mm2' as const,
+          },
+        ],
+      },
+      valid_3d: true,
+    }
+    const hidden = render(<Preview2D geometry={geometry} />)
+    expect(hidden.container.querySelector('[data-testid="weak-point-layer"]')).toBeNull()
+    hidden.unmount()
+
+    const { container } = render(<Preview2D geometry={geometry} showWeakPoints />)
+    expect(screen.getByRole('img', { name: /1 potential weak point highlighted/ })).toBeInTheDocument()
+    const markers = container.querySelectorAll('[data-weak-point]')
+    expect(markers).toHaveLength(1)
+    expect(markers[0]).toHaveAttribute('transform', 'translate(20 10)')
+    expect(markers[0].querySelector('line')).toHaveAttribute('y1', '-1')
+    expect(markers[0].querySelector('line')).toHaveAttribute('y2', '1')
+    expect(markers[0].querySelector('title')?.textContent).toContain('guideline')
+    expect(screen.getByText('Potential weak point')).toBeInTheDocument()
   })
 })

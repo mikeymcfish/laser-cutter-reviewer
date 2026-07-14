@@ -1,6 +1,7 @@
 import { jsPDF } from 'jspdf'
 import type { AnalysisCheck, AnalysisReport, CheckStatus, PreviewPath, PreviewRasterLayer } from './types'
 import { checkStatus } from './types'
+import { rasterPlacement } from './rasterPlacement'
 import { formatCutDensityInches, formatDimensionsInches, formatInches } from './units'
 
 interface ManualCheck {
@@ -34,34 +35,6 @@ const loadPng = (source: string) => new Promise<HTMLImageElement>((resolve, reje
   image.onerror = () => reject(new Error('The sanitized raster preview could not be decoded.'))
   image.src = source
 })
-
-const canonicalPreserveAspectRatio = (value: string) => (
-  /^(?:none|x(?:Min|Mid|Max)Y(?:Min|Mid|Max) (?:meet|slice))$/.test(value)
-    ? value
-    : 'xMidYMid meet'
-)
-
-const rasterPlacement = (image: HTMLImageElement, preserve: string) => {
-  const canonical = canonicalPreserveAspectRatio(preserve)
-  if (canonical === 'none') return { x: 0, y: 0, width: 1, height: 1 }
-  const [alignment, scaling = 'meet'] = canonical.split(' ')
-  const pixelWidth = image.naturalWidth || image.width || 1
-  const pixelHeight = image.naturalHeight || image.height || 1
-  const aspect = pixelWidth / pixelHeight
-  let width = 1
-  let height = 1
-  if (scaling === 'slice') {
-    if (aspect >= 1) width = aspect
-    else height = 1 / aspect
-  } else if (aspect >= 1) {
-    height = 1 / aspect
-  } else {
-    width = aspect
-  }
-  const x = alignment.startsWith('xMin') ? 0 : alignment.startsWith('xMax') ? 1 - width : (1 - width) / 2
-  const y = alignment.includes('YMin') ? 0 : alignment.includes('YMax') ? 1 - height : (1 - height) / 2
-  return { x, y, width, height }
-}
 
 interface PreparedRaster {
   layer: PreviewRasterLayer
@@ -145,7 +118,12 @@ const previewDataUrl = async (report: AnalysisReport): Promise<string | null> =>
     }
     const { layer, image } = previewLayer.raster
     const [topLeft, topRight, , bottomLeft] = layer.corners_mm
-    const placement = rasterPlacement(image, layer.preserve_aspect_ratio)
+    const placement = rasterPlacement(
+      image.naturalWidth || image.width || 1,
+      image.naturalHeight || image.height || 1,
+      layer.viewport_aspect_ratio,
+      layer.preserve_aspect_ratio,
+    )
     context.save()
     try {
       context.globalCompositeOperation = 'multiply'
@@ -216,6 +194,7 @@ export const reportFileFacts = (report: AnalysisReport): Array<{ label: string; 
     { label: 'Raster DPI guideline', value: reportNumber(report.metrics.required_raster_dpi, ' DPI') },
     { label: 'Fonts', value: fontSummary },
     { label: 'Smallest feature', value: formatInches(smallestFeature, 3, 'Not reported') },
+    { label: 'Potential weak points', value: `${reportNumber(report.metrics.weak_point_count ?? report.geometry.weak_points?.points.length ?? 0)} (${String(report.metrics.weak_point_scan_status ?? report.geometry.weak_points?.status ?? 'unverified')})` },
     { label: 'Minimum cut spacing', value: formatInches(report.metrics.minimum_cut_spacing_mm, 3, 'Not reported') },
     { label: 'Cut density', value: formatCutDensityInches(report.metrics.cut_density_mm_per_mm2, 3, 'Not reported') },
     { label: 'Heat-density guideline', value: formatCutDensityInches(report.metrics.heat_density_threshold_mm_per_mm2, 3, 'Not reported') },

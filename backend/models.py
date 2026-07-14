@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, field_validator, model_validator
 
 
 SeverityState = Literal["blocker", "warning", "info", "unverified"]
@@ -103,7 +103,7 @@ class AssignmentProfile(StrictModel):
     id: str
     name: str
     description: str
-    page_policy: Literal["exact", "fit_bed"]
+    page_policy: Literal["exact", "fit_within", "fit_bed"]
     expected_width_mm: float | None = Field(default=None, gt=0)
     expected_height_mm: float | None = Field(default=None, gt=0)
     page_tolerance_mm: float = Field(default=0.25, ge=0)
@@ -114,10 +114,10 @@ class AssignmentProfile(StrictModel):
 
     @model_validator(mode="after")
     def validate_page_policy(self) -> "AssignmentProfile":
-        if self.page_policy == "exact" and (
+        if self.page_policy in {"exact", "fit_within"} and (
             self.expected_width_mm is None or self.expected_height_mm is None
         ):
-            raise ValueError("exact page assignments need expected width and height")
+            raise ValueError("exact and fit-within page assignments need expected width and height")
         process_ids = [process.id for process in self.processes]
         if len(process_ids) != len(set(process_ids)):
             raise ValueError("process IDs must be unique within an assignment")
@@ -192,7 +192,7 @@ class LabProfile(StrictModel):
         if len(material_ids) != len(set(material_ids)):
             raise ValueError("material IDs must be unique")
         for assignment in self.assignments:
-            if assignment.page_policy != "exact":
+            if assignment.page_policy not in {"exact", "fit_within"}:
                 continue
             if (
                 (assignment.expected_width_mm or 0) > self.machine.usable_width_mm + assignment.page_tolerance_mm
@@ -351,6 +351,7 @@ class PreviewRasterLayer(StrictModel):
     opacity: float = Field(default=1.0, ge=0, le=1)
     blend_mode: Literal["multiply"] = "multiply"
     preserve_aspect_ratio: PreserveAspectRatio = "xMidYMid meet"
+    viewport_aspect_ratio: FiniteFloat = Field(gt=0)
 
     @field_validator("corners_mm")
     @classmethod
@@ -360,18 +361,56 @@ class PreviewRasterLayer(StrictModel):
         return value
 
 
+class PreviewWeakPoint(StrictModel):
+    id: str
+    kind: Literal["narrow_feature", "close_cut_spacing", "tiny_piece"]
+    label: str
+    object_ids: list[str] = Field(min_length=1, max_length=2)
+    location_mm: tuple[FiniteFloat, FiniteFloat]
+    span_mm: tuple[tuple[FiniteFloat, FiniteFloat], tuple[FiniteFloat, FiniteFloat]] | None = None
+    measurement: FiniteFloat = Field(ge=0)
+    threshold: FiniteFloat = Field(gt=0)
+    unit: Literal["mm", "mm2"]
+
+    @model_validator(mode="after")
+    def validate_measurement_shape(self) -> "PreviewWeakPoint":
+        if self.kind == "tiny_piece":
+            if self.unit != "mm2" or self.span_mm is not None:
+                raise ValueError("tiny-piece weak points use area measurements without a span")
+        elif self.unit != "mm" or self.span_mm is None:
+            raise ValueError("linear weak points require a two-point millimeter span")
+        if self.kind == "close_cut_spacing" and len(self.object_ids) != 2:
+            raise ValueError("close-cut weak points require two affected objects")
+        if self.kind != "close_cut_spacing" and len(self.object_ids) != 1:
+            raise ValueError("single-object weak points require one affected object")
+        return self
+
+
+class WeakPointPreview(StrictModel):
+    status: Literal["complete", "partial", "unavailable"]
+    message: str
+    points: list[PreviewWeakPoint] = Field(default_factory=list, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_status(self) -> "WeakPointPreview":
+        if self.status == "unavailable" and self.points:
+            raise ValueError("an unavailable weak-point scan cannot contain localized points")
+        return self
+
+
 class PreviewGeometry(StrictModel):
     page: dict[str, float | None]
     paths: list[PreviewPath]
     pieces: list[PreviewPiece]
     raster_assets: list[PreviewRasterAsset] = Field(default_factory=list)
     raster_layers: list[PreviewRasterLayer] = Field(default_factory=list)
+    weak_points: WeakPointPreview
     valid_3d: bool
     invalid_reason: str | None = None
 
 
 class AnalysisReport(StrictModel):
-    report_version: str = "1.2"
+    report_version: str = "1.3"
     analyzed_at: str
     file: FileInfo
     profile: ProfileReference

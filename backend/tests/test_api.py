@@ -28,7 +28,7 @@ def test_known_good_svg_returns_normalized_report(client, good_svg):
     response = post_svg(client, good_svg)
     assert response.status_code == 200, response.text
     report = response.json()
-    assert report["report_version"] == "1.2"
+    assert report["report_version"] == "1.3"
     assert report["file"]["sha256"] == expected_hash(good_svg)
     assert report["file"]["name"] == "student.svg"
     assert report["document"]["width_mm"] == 304.8
@@ -156,24 +156,63 @@ def test_shared_use_target_is_never_auto_fixed_across_different_instances(client
     assert "use" in fixed.json()["detail"].lower()
 
 
-def test_default_assignment_requires_twelve_inch_square(client, good_svg):
+def test_default_assignment_accepts_artboards_up_to_twelve_inch_square(client, good_svg):
     accepted = post_svg(client, good_svg).json()
     assert check(accepted, "document.page_size")["state"] == "pass"
 
-    old_page = good_svg.replace(b'height="12in"', b'height="8in"').replace(
+    smaller_page = good_svg.replace(b'height="12in"', b'height="8in"').replace(
         b'viewBox="0 0 1152 1152"', b'viewBox="0 0 1152 768"'
     )
-    rejected = post_svg(client, old_page).json()
+    smaller = post_svg(client, smaller_page).json()
+    assert check(smaller, "document.page_size")["state"] == "pass"
+    assert check(smaller, "document.page_size")["fix_actions"] == []
+    no_grow_response = client.post(
+        "/api/v1/fix-artboard",
+        files={"file": ("smaller.svg", smaller_page, "image/svg+xml")},
+        data={"assignment_id": "intro-svg", "expected_sha256": expected_hash(smaller_page)},
+    )
+    assert no_grow_response.status_code == 422
+    assert "already satisfies" in no_grow_response.json()["detail"].lower()
+
+    oversized_page = good_svg.replace(b'width="12in"', b'width="13in"').replace(
+        b'viewBox="0 0 1152 1152"', b'viewBox="0 0 1248 1152"'
+    )
+    rejected = post_svg(client, oversized_page).json()
     assert check(rejected, "document.page_size")["state"] == "blocker"
+    rejected_page_check = check(rejected, "document.page_size")
+    assert rejected_page_check["message"] == "The artboard is larger than the assignment allows."
+    assert any(
+        "Maximum 12.0000 in x 12.0000 in" in item
+        for item in rejected_page_check["evidence"]
+    )
+
+
+def test_open_studio_keeps_usable_bed_page_policy(client):
+    fits_bed = svg_document(
+        '<rect id="part" x="96" y="96" width="192" height="192" '
+        'fill="none" stroke="#000" stroke-width=".096"/>',
+        width="20in",
+        height="12in",
+        viewbox="0 0 1920 1152",
+    )
+    accepted = post_svg(client, fits_bed, assignment="open-studio").json()
+    assert check(accepted, "document.page_size")["state"] == "pass"
+
+    wider_than_bed = fits_bed.replace(b'width="20in"', b'width="33in"').replace(
+        b'viewBox="0 0 1920 1152"', b'viewBox="0 0 3168 1152"'
+    )
+    rejected = post_svg(client, wider_than_bed, assignment="open-studio").json()
+    assert check(rejected, "document.page_size")["state"] == "blocker"
+    assert check(rejected, "document.page_size")["fix_actions"] == []
 
 
 def test_fix_artboard_preserves_physical_geometry_and_viewbox_origin(client):
     data = svg_document(
         '<rect id="part" x="133" y="149" width="288" height="192" '
         'fill="none" stroke="#000" stroke-width=".096"/>',
-        width="12in",
+        width="13in",
         height="8in",
-        viewbox="37 53 1152 768",
+        viewbox="37 53 1248 768",
     )
     original = bytes(data)
     analyzed = post_svg(client, data).json()
@@ -183,7 +222,7 @@ def test_fix_artboard_preserves_physical_geometry_and_viewbox_origin(client):
         {
             "id": "set-artboard",
             "kind": "set_artboard",
-            "label": "Set artboard to 12.0000 in x 12.0000 in",
+            "label": "Set artboard to 12.0000 in x 8.0000 in",
             "description": (
                 "Creates a separate SVG copy with the assignment artboard size while preserving "
                 "the artwork's physical scale and coordinates. The original file is unchanged."
@@ -194,7 +233,7 @@ def test_fix_artboard_preserves_physical_geometry_and_viewbox_origin(client):
             "target_color": None,
             "target_stroke_width_in": None,
             "target_width_in": 12.0,
-            "target_height_in": 12.0,
+            "target_height_in": 8.0,
         }
     ]
     before_path = next(path for path in analyzed["geometry"]["paths"] if path["id"] == "part")
@@ -207,14 +246,14 @@ def test_fix_artboard_preserves_physical_geometry_and_viewbox_origin(client):
     assert response.status_code == 200, response.text
     assert response.headers["x-original-sha256"] == expected_hash(data)
     assert response.headers["x-artboard-width-in"] == "12"
-    assert response.headers["x-artboard-height-in"] == "12"
+    assert response.headers["x-artboard-height-in"] == "8"
     assert "student-artboard-fixed.svg" in response.headers["content-disposition"]
     assert data == original
     assert response.content != data
     assert b'width="12in"' in response.content
-    assert b'height="12in"' in response.content
-    assert b'viewBox="37 53 1152 1152"' in response.content
-    assert b'style="width:12in;height:12in"' in response.content
+    assert b'height="8in"' in response.content
+    assert b'viewBox="37 53 1152 768"' in response.content
+    assert b'style="width:12in;height:8in"' in response.content
 
     reanalyzed = post_svg(client, response.content, name="student-artboard-fixed.svg").json()
     assert check(reanalyzed, "document.page_size")["state"] == "pass"
@@ -243,7 +282,7 @@ def test_fix_artboard_rejects_stale_fingerprint(client):
 
 def test_artboard_fix_is_withheld_without_reliable_viewbox(client):
     data = (
-        b'<svg xmlns="http://www.w3.org/2000/svg" width="12in" height="8in">'
+        b'<svg xmlns="http://www.w3.org/2000/svg" width="13in" height="8in">'
         b'<rect id="part" x="96" y="96" width="192" height="192" '
         b'fill="none" stroke="#000" stroke-width=".096"/></svg>'
     )
@@ -265,8 +304,9 @@ def test_artboard_fix_is_withheld_for_external_or_active_resources(client):
         '<image id="linked" x="96" y="96" width="96" height="96" href="file:///student/photo.png"/>'
         '<rect id="part" x="300" y="96" width="192" height="192" '
         'fill="none" stroke="#000" stroke-width=".096"/>',
+        width="13in",
         height="8in",
-        viewbox="0 0 1152 768",
+        viewbox="0 0 1248 768",
     )
     report = post_svg(client, external).json()
     assert check(report, "document.page_size")["fix_actions"] == []
