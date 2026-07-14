@@ -16,7 +16,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .models import AnalysisReport
 from .profile import get_assignment, get_material, load_profile, public_profile
-from .svg_analyzer import SVGAnalysisError, analyze_svg, failure_report, fix_strokes
+from .svg_analyzer import SVGAnalysisError, analyze_svg, failure_report, fix_artboard, fix_strokes
 
 
 logger = logging.getLogger("laser_reviewer")
@@ -49,7 +49,9 @@ class AggregateRequestLimitMiddleware:
         if not (
             scope["type"] == "http"
             and scope.get("method") == "POST"
-            and scope.get("path") in {"/api/v1/analyze", "/api/v1/fix-strokes"}
+            and scope.get("path") in {
+                "/api/v1/analyze", "/api/v1/fix-strokes", "/api/v1/fix-artboard"
+            }
         ):
             await self.app(scope, receive, send)
             return
@@ -108,7 +110,7 @@ class AggregateRequestLimitMiddleware:
 
 app = FastAPI(
     title="Laser Cutter Reviewer API",
-    version="1.1.0",
+    version="1.2.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
@@ -326,6 +328,75 @@ async def fix_strokes_endpoint(
             "X-Original-SHA256": expected_sha256.lower(),
             "X-Fixed-SHA256": fixed_sha256,
             "X-Corrected-Stroke-Count": str(len(fixed.changed_source_ids)),
+        },
+    )
+
+
+@app.post("/api/v1/fix-artboard", tags=["preflight"])
+async def fix_artboard_endpoint(
+    file: Annotated[UploadFile, File(description="The same SVG that was analyzed")],
+    assignment_id: Annotated[str, Form()],
+    expected_sha256: Annotated[str, Form()],
+) -> Response:
+    profile = load_profile()
+    try:
+        assignment = get_assignment(profile, assignment_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=422, detail=f"Unknown assignment_id: {assignment_id}") from exc
+    data, filename = await _read_svg_upload(file, profile.limits.max_upload_bytes)
+    expected_sha256 = expected_sha256.strip().lower()
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise HTTPException(
+            status_code=409,
+            detail="This SVG no longer matches the analyzed file. Analyze it again before correcting the artboard.",
+        )
+
+    try:
+        await asyncio.wait_for(ANALYSIS_SEMAPHORE.acquire(), timeout=2.0)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=503, detail="Analyzer is busy; try again shortly") from exc
+    release_on_exit = True
+    try:
+        fix_task = asyncio.create_task(
+            asyncio.to_thread(
+                fix_artboard,
+                data=data,
+                expected_sha256=expected_sha256,
+                profile=profile,
+                assignment=assignment,
+            )
+        )
+        try:
+            fixed = await asyncio.wait_for(
+                asyncio.shield(fix_task),
+                timeout=profile.limits.analysis_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            release_on_exit = False
+            fix_task.add_done_callback(_release_analysis_permit)
+            raise HTTPException(status_code=504, detail="Artboard correction exceeded the analysis time limit") from exc
+        except asyncio.CancelledError:
+            release_on_exit = False
+            fix_task.add_done_callback(_release_analysis_permit)
+            raise
+    finally:
+        if release_on_exit:
+            ANALYSIS_SEMAPHORE.release()
+
+    safe_stem = "".join(
+        character for character in Path(filename).stem
+        if character.isascii() and (character.isalnum() or character in {"-", "_"})
+    )[:120] or "laser-file"
+    fixed_sha256 = hashlib.sha256(fixed.data).hexdigest()
+    return Response(
+        content=fixed.data,
+        media_type="image/svg+xml",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_stem}-artboard-fixed.svg"',
+            "X-Original-SHA256": expected_sha256,
+            "X-Fixed-SHA256": fixed_sha256,
+            "X-Artboard-Width-In": f"{fixed.target_width_mm / 25.4:g}",
+            "X-Artboard-Height-In": f"{fixed.target_height_mm / 25.4:g}",
         },
     )
 

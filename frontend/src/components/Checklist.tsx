@@ -36,6 +36,29 @@ const evidenceText = (evidence: AnalysisCheck['evidence']) => {
     .join(' · ')
 }
 
+const fixPresentation = (action: FixAction) => {
+  if (action.kind === 'set_artboard') {
+    const width = Number.isInteger(action.target_width_in) ? action.target_width_in : Number(action.target_width_in.toFixed(3))
+    const height = Number.isInteger(action.target_height_in) ? action.target_height_in : Number(action.target_height_in.toFixed(3))
+    const dimensions = `${width} × ${height} in`
+    return {
+      heading: `Changes the page only to ${dimensions}`,
+      caution: 'The new artboard is anchored at the top-left. Artwork is not scaled or moved.',
+      button: 'Fix page only & re-review',
+      busy: 'Fixing page & reviewing…',
+      ariaLabel: `Fix artboard page only to ${dimensions}; anchor top-left without scaling or moving artwork; download and re-review`,
+    }
+  }
+  const countLabel = `${action.count} ${action.count === 1 ? 'stroke' : 'strokes'}`
+  return {
+    heading: 'Creates through-cuts: #000000 at 0.001 in',
+    caution: 'Use this only for intended cuts. It changes every highlighted stroke into a through-cut, including any that was meant to engrave.',
+    button: 'Fix as through-cuts & re-review',
+    busy: 'Fixing through-cuts & reviewing…',
+    ariaLabel: `Fix ${countLabel} by creating through-cuts in RGB black at 0.001 inches; download and re-review`,
+  }
+}
+
 export function Checklist({ checks, selectedId, onSelect, onFixAction, fixingActionId }: ChecklistProps) {
   const [filter, setFilter] = useState<CheckStatus | 'all'>('all')
   const counts = useMemo(() => {
@@ -125,14 +148,14 @@ export function Checklist({ checks, selectedId, onSelect, onFixAction, fixingAct
                       <div className="fix-actions" aria-label="Available corrections">
                         {check.fix_actions.map((action) => {
                           const fixing = fixingActionId === action.id
-                          const countLabel = `${action.count} ${action.count === 1 ? 'stroke' : 'strokes'}`
+                          const presentation = fixPresentation(action)
                           return (
                             <div className="fix-action" key={action.id}>
                               <p>
-                                <strong>Creates through-cuts: #000000 at 0.001 in</strong>
+                                <strong>{presentation.heading}</strong>
                                 <span>{action.description}</span>
-                                <span>If any highlighted stroke is intentional engraving, cancel and correct it in Illustrator instead.</span>
-                                <span>Your original stays unchanged. Re-upload the corrected copy to verify it before submitting.</span>
+                                <span>{presentation.caution}</span>
+                                <span>One click downloads a separate corrected SVG and immediately refreshes this preview. Your original file stays unchanged.</span>
                               </p>
                               <button
                                 type="button"
@@ -140,10 +163,10 @@ export function Checklist({ checks, selectedId, onSelect, onFixAction, fixingAct
                                 onClick={() => void onFixAction(action)}
                                 disabled={Boolean(fixingActionId)}
                                 aria-busy={fixing}
-                                aria-label={`${action.label}: change ${countLabel} to RGB black and 0.001 inches in a downloaded copy`}
+                                aria-label={presentation.ariaLabel}
                               >
                                 {fixing ? <span className="button-spinner" aria-hidden="true" /> : <DownloadIcon size={16} />}
-                                {fixing ? 'Preparing corrected copy…' : action.label}
+                                {fixing ? presentation.busy : presentation.button}
                               </button>
                             </div>
                           )

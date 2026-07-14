@@ -66,7 +66,28 @@ class ProcessProfile(StrictModel):
     color: str
     stroke_width_mm: float = Field(gt=0)
     stroke_tolerance_mm: float = Field(ge=0)
+    stroke_lower_tolerance_mm: float | None = Field(default=None, ge=0)
     require_closed: bool = True
+
+    @model_validator(mode="after")
+    def validate_stroke_tolerances(self) -> "ProcessProfile":
+        lower_tolerance = (
+            self.stroke_tolerance_mm
+            if self.stroke_lower_tolerance_mm is None
+            else self.stroke_lower_tolerance_mm
+        )
+        if lower_tolerance >= self.stroke_width_mm:
+            raise ValueError("process lower stroke tolerance must leave a positive accepted width")
+        return self
+
+    @property
+    def effective_lower_tolerance_mm(self) -> float:
+        """Use the historical symmetric tolerance when no lower override is configured."""
+        return (
+            self.stroke_tolerance_mm
+            if self.stroke_lower_tolerance_mm is None
+            else self.stroke_lower_tolerance_mm
+        )
 
     @field_validator("color")
     @classmethod
@@ -216,15 +237,35 @@ class CheckResult(StrictModel):
 
 
 class FixAction(StrictModel):
-    id: Literal["normalize-cut-strokes"]
-    kind: Literal["normalize_cut_strokes"] = "normalize_cut_strokes"
+    id: Literal["normalize-cut-strokes", "set-artboard"]
+    kind: Literal["normalize_cut_strokes", "set_artboard"]
     label: str
     description: str
-    endpoint: Literal["/api/v1/fix-strokes"] = "/api/v1/fix-strokes"
+    endpoint: Literal["/api/v1/fix-strokes", "/api/v1/fix-artboard"]
     object_ids: list[str] = Field(default_factory=list)
     count: int = Field(gt=0)
-    target_color: Literal["#000000"] = "#000000"
-    target_stroke_width_in: Literal[0.001] = 0.001
+    target_color: Literal["#000000"] | None = None
+    target_stroke_width_in: Literal[0.001] | None = None
+    target_width_in: float | None = Field(default=None, gt=0)
+    target_height_in: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_action_contract(self) -> "FixAction":
+        if self.kind == "normalize_cut_strokes":
+            if self.id != "normalize-cut-strokes" or self.endpoint != "/api/v1/fix-strokes":
+                raise ValueError("stroke fix action identifiers do not match")
+            if self.target_color != "#000000" or self.target_stroke_width_in != 0.001:
+                raise ValueError("stroke fix action needs the configured cut targets")
+            if self.target_width_in is not None or self.target_height_in is not None:
+                raise ValueError("stroke fix action cannot include artboard targets")
+        else:
+            if self.id != "set-artboard" or self.endpoint != "/api/v1/fix-artboard":
+                raise ValueError("artboard fix action identifiers do not match")
+            if self.target_width_in is None or self.target_height_in is None:
+                raise ValueError("artboard fix action needs width and height targets")
+            if self.target_color is not None or self.target_stroke_width_in is not None:
+                raise ValueError("artboard fix action cannot include stroke targets")
+        return self
 
 
 class FileInfo(StrictModel):
@@ -330,7 +371,7 @@ class PreviewGeometry(StrictModel):
 
 
 class AnalysisReport(StrictModel):
-    report_version: str = "1.1"
+    report_version: str = "1.2"
     analyzed_at: str
     file: FileInfo
     profile: ProfileReference

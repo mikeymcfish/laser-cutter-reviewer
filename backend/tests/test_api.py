@@ -28,7 +28,7 @@ def test_known_good_svg_returns_normalized_report(client, good_svg):
     response = post_svg(client, good_svg)
     assert response.status_code == 200, response.text
     report = response.json()
-    assert report["report_version"] == "1.1"
+    assert report["report_version"] == "1.2"
     assert report["file"]["sha256"] == expected_hash(good_svg)
     assert report["file"]["name"] == "student.svg"
     assert report["document"]["width_mm"] == 304.8
@@ -165,6 +165,130 @@ def test_default_assignment_requires_twelve_inch_square(client, good_svg):
     )
     rejected = post_svg(client, old_page).json()
     assert check(rejected, "document.page_size")["state"] == "blocker"
+
+
+def test_fix_artboard_preserves_physical_geometry_and_viewbox_origin(client):
+    data = svg_document(
+        '<rect id="part" x="133" y="149" width="288" height="192" '
+        'fill="none" stroke="#000" stroke-width=".096"/>',
+        width="12in",
+        height="8in",
+        viewbox="37 53 1152 768",
+    )
+    original = bytes(data)
+    analyzed = post_svg(client, data).json()
+    page = check(analyzed, "document.page_size")
+    assert page["state"] == "blocker"
+    assert page["fix_actions"] == [
+        {
+            "id": "set-artboard",
+            "kind": "set_artboard",
+            "label": "Set artboard to 12.0000 in x 12.0000 in",
+            "description": (
+                "Creates a separate SVG copy with the assignment artboard size while preserving "
+                "the artwork's physical scale and coordinates. The original file is unchanged."
+            ),
+            "endpoint": "/api/v1/fix-artboard",
+            "object_ids": [],
+            "count": 1,
+            "target_color": None,
+            "target_stroke_width_in": None,
+            "target_width_in": 12.0,
+            "target_height_in": 12.0,
+        }
+    ]
+    before_path = next(path for path in analyzed["geometry"]["paths"] if path["id"] == "part")
+
+    response = client.post(
+        "/api/v1/fix-artboard",
+        files={"file": ("student.svg", data, "image/svg+xml")},
+        data={"assignment_id": "intro-svg", "expected_sha256": expected_hash(data)},
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-original-sha256"] == expected_hash(data)
+    assert response.headers["x-artboard-width-in"] == "12"
+    assert response.headers["x-artboard-height-in"] == "12"
+    assert "student-artboard-fixed.svg" in response.headers["content-disposition"]
+    assert data == original
+    assert response.content != data
+    assert b'width="12in"' in response.content
+    assert b'height="12in"' in response.content
+    assert b'viewBox="37 53 1152 1152"' in response.content
+    assert b'style="width:12in;height:12in"' in response.content
+
+    reanalyzed = post_svg(client, response.content, name="student-artboard-fixed.svg").json()
+    assert check(reanalyzed, "document.page_size")["state"] == "pass"
+    assert check(reanalyzed, "document.page_size")["fix_actions"] == []
+    after_path = next(path for path in reanalyzed["geometry"]["paths"] if path["id"] == "part")
+    assert after_path["points"] == before_path["points"]
+    assert after_path["bounds"] == before_path["bounds"]
+    assert after_path["stroke_width_mm"] == before_path["stroke_width_mm"]
+
+
+def test_fix_artboard_rejects_stale_fingerprint(client):
+    data = svg_document(
+        '<rect id="part" x="96" y="96" width="192" height="192" '
+        'fill="none" stroke="#000" stroke-width=".096"/>',
+        height="8in",
+        viewbox="0 0 1152 768",
+    )
+    response = client.post(
+        "/api/v1/fix-artboard",
+        files={"file": ("student.svg", data, "image/svg+xml")},
+        data={"assignment_id": "intro-svg", "expected_sha256": "0" * 64},
+    )
+    assert response.status_code == 409
+    assert "analyze" in response.json()["detail"].lower()
+
+
+def test_artboard_fix_is_withheld_without_reliable_viewbox(client):
+    data = (
+        b'<svg xmlns="http://www.w3.org/2000/svg" width="12in" height="8in">'
+        b'<rect id="part" x="96" y="96" width="192" height="192" '
+        b'fill="none" stroke="#000" stroke-width=".096"/></svg>'
+    )
+    report = post_svg(client, data).json()
+    assert check(report, "document.page_size")["state"] == "blocker"
+    assert check(report, "document.page_size")["fix_actions"] == []
+
+    response = client.post(
+        "/api/v1/fix-artboard",
+        files={"file": ("student.svg", data, "image/svg+xml")},
+        data={"assignment_id": "intro-svg", "expected_sha256": expected_hash(data)},
+    )
+    assert response.status_code == 422
+    assert "viewbox" in response.json()["detail"].lower()
+
+
+def test_artboard_fix_is_withheld_for_external_or_active_resources(client):
+    external = svg_document(
+        '<image id="linked" x="96" y="96" width="96" height="96" href="file:///student/photo.png"/>'
+        '<rect id="part" x="300" y="96" width="192" height="192" '
+        'fill="none" stroke="#000" stroke-width=".096"/>',
+        height="8in",
+        viewbox="0 0 1152 768",
+    )
+    report = post_svg(client, external).json()
+    assert check(report, "document.page_size")["fix_actions"] == []
+    response = client.post(
+        "/api/v1/fix-artboard",
+        files={"file": ("student.svg", external, "image/svg+xml")},
+        data={"assignment_id": "intro-svg", "expected_sha256": expected_hash(external)},
+    )
+    assert response.status_code == 422
+    assert "embed" in response.json()["detail"].lower()
+
+    active = (
+        b'<svg xmlns="http://www.w3.org/2000/svg" width="12in" height="8in" '
+        b'viewBox="0 0 1152 768"><script>alert(1)</script></svg>'
+    )
+    active_response = client.post(
+        "/api/v1/fix-artboard",
+        files={"file": ("student.svg", active, "image/svg+xml")},
+        data={"assignment_id": "intro-svg", "expected_sha256": expected_hash(active)},
+    )
+    assert active_response.status_code == 422
+    assert "script" in active_response.json()["detail"].lower()
 
 
 def test_malformed_and_active_svg_are_structured_blockers(client):

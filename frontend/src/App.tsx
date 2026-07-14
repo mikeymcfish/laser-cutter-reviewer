@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
-import { analyzeSvg, fixSvgStrokes, getProfile, sha256File } from './api'
+import { analyzeSvg, fixSvg, getProfile, sha256File } from './api'
 import { Checklist } from './components/Checklist'
 import { CubeIcon, DownloadIcon, InfoIcon, ResetIcon, SparkIcon, WarningIcon } from './components/Icons'
 import { Preview2D } from './components/Preview2D'
@@ -37,9 +37,11 @@ const countChecks = (checks: AnalysisCheck[]) => {
 
 const fileName = (report: AnalysisReport) => report.file.name ?? report.file.filename ?? 'SVG file'
 
-const correctedFileName = (name: string) => {
+const correctedFileName = (name: string, action: FixAction) => {
   const stem = name.replace(/\.svg$/i, '').replace(/[^a-z0-9._-]+/gi, '-') || 'laser-file'
-  return `${stem}-cut-strokes-fixed.svg`
+  const suffix = action.kind === 'set_artboard' ? 'artboard-fixed' : 'cut-strokes-fixed'
+  if (stem.toLowerCase().endsWith(`-${suffix}`)) return `${stem}.svg`
+  return `${stem}-${suffix}.svg`
 }
 
 const metricValue = (value: unknown, suffix = '') => {
@@ -79,6 +81,10 @@ export default function App() {
   const [fixError, setFixError] = useState('')
   const [fixMessage, setFixMessage] = useState('')
   const fileSelectionToken = useRef(0)
+  const fixOperationToken = useRef(0)
+  const fixInFlight = useRef(false)
+  const currentReviewContext = useRef({ file, assignmentId, materialId, thicknessMm })
+  currentReviewContext.current = { file, assignmentId, materialId, thicknessMm }
 
   const loadProfile = () => {
     setProfileLoading(true)
@@ -111,11 +117,25 @@ export default function App() {
   const selectedAssignment = profileData?.assignments.find((item) => item.id === assignmentId)
   const manualLabels = useMemo(() => asOperatorLabels(profileData), [profileData])
   const maxUploadBytes = profileData?.limits?.max_upload_bytes ?? Number.POSITIVE_INFINITY
+  const correctionBusy = fixingActionId !== null
 
   const onMaterialChange = (id: string) => {
+    fixOperationToken.current += 1
     setMaterialId(id)
     const next = profileData?.materials.find((item) => item.id === id)
     setThicknessMm(materialThicknesses(next)[0]?.value ?? Number.NaN)
+    clearResult()
+  }
+
+  const onAssignmentChange = (id: string) => {
+    fixOperationToken.current += 1
+    setAssignmentId(id)
+    clearResult()
+  }
+
+  const onThicknessChange = (value: number) => {
+    fixOperationToken.current += 1
+    setThicknessMm(value)
     clearResult()
   }
 
@@ -131,6 +151,7 @@ export default function App() {
   }
 
   const onFileChange = async (candidate: File | null) => {
+    fixOperationToken.current += 1
     const selectionToken = ++fileSelectionToken.current
     setFileError('')
     setFileHash('')
@@ -205,6 +226,7 @@ export default function App() {
 
   const reset = () => {
     fileSelectionToken.current += 1
+    fixOperationToken.current += 1
     setFile(null)
     setFileHash('')
     setFileError('')
@@ -234,40 +256,84 @@ export default function App() {
   }
 
   const onFixAction = async (action: FixAction) => {
-    if (!file || !report || !assignmentId) return
+    if (fixInFlight.current || !file || !report || !assignmentId || !materialId || !Number.isFinite(thicknessMm)) return
+    const sourceFile = file
+    const sourceAssignmentId = assignmentId
+    const sourceMaterialId = materialId
+    const sourceThicknessMm = thicknessMm
+    const operationToken = ++fixOperationToken.current
+    const contextIsCurrent = () => {
+      const current = currentReviewContext.current
+      return fixOperationToken.current === operationToken
+        && current.file === sourceFile
+        && current.assignmentId === sourceAssignmentId
+        && current.materialId === sourceMaterialId
+        && current.thicknessMm === sourceThicknessMm
+    }
     const expectedSha256 = (report.file.sha256 || fileHash).toLowerCase()
     if (!expectedSha256) {
       setFixError('The source fingerprint is unavailable. Choose the SVG again before requesting a corrected copy.')
       return
     }
-    const strokeLabel = `${action.count} highlighted ${action.count === 1 ? 'stroke' : 'strokes'}`
-    const confirmed = window.confirm(
-      `This will turn ${strokeLabel} into through-cuts (#000000 at 0.001 in).\n\nIf any highlighted stroke is intentional engraving, choose Cancel and correct the file in Illustrator instead.\n\nYour original SVG will stay unchanged. Download the corrected copy?`,
-    )
-    if (!confirmed) return
+    fixInFlight.current = true
     setFixingActionId(action.id)
     setFixError('')
     setFixMessage('')
     try {
-      const corrected = await fixSvgStrokes(file, { assignmentId, expectedSha256 })
+      const corrected = await fixSvg(sourceFile, action, { assignmentId: sourceAssignmentId, expectedSha256 })
+      if (!contextIsCurrent()) return
       if (!corrected.size) throw new Error('The correction service returned an empty file. Make the changes in Illustrator instead.')
-      const url = URL.createObjectURL(corrected)
+      if (corrected.size > maxUploadBytes) throw new Error('The corrected SVG is larger than the lab upload limit. Make the change in Illustrator instead.')
+
+      const nextName = correctedFileName(sourceFile.name, action)
+      const correctedFile = new File([corrected], nextName, {
+        type: 'image/svg+xml',
+        lastModified: Date.now(),
+      })
+      const url = URL.createObjectURL(correctedFile)
       try {
         const link = document.createElement('a')
         link.href = url
-        link.download = correctedFileName(file.name)
+        link.download = nextName
         document.body.appendChild(link)
         link.click()
         link.remove()
       } finally {
         URL.revokeObjectURL(url)
       }
-      setFixMessage(`Corrected copy downloaded. Re-upload ${correctedFileName(file.name)} to verify the changes before submitting.`)
+
+      const correctedHash = await sha256File(correctedFile)
+      if (!contextIsCurrent()) return
+      const refreshedReport = await analyzeSvg(correctedFile, {
+        assignmentId: sourceAssignmentId,
+        materialId: sourceMaterialId,
+        thicknessMm: sourceThicknessMm,
+      })
+      if (!contextIsCurrent()) return
+      const serviceHash = refreshedReport.file.sha256?.toLowerCase()
+      if (serviceHash && serviceHash !== correctedHash.toLowerCase()) {
+        throw new Error('The refreshed review fingerprint did not match the corrected copy. The previous review is still shown; choose the downloaded SVG to try again.')
+      }
+
+      fileSelectionToken.current += 1
+      setFile(correctedFile)
+      setFileHash(correctedHash)
+      setReport(refreshedReport)
+      setSelectedCheck(undefined)
+      setManualState({})
+      setViewMode('2d')
+      setAnalysisError('')
+      const changeLabel = action.kind === 'set_artboard' ? 'Artboard fixed' : 'Through-cut strokes fixed'
+      setFixMessage(`${changeLabel}. ${nextName} was downloaded and the corrected copy is now shown in the preview.`)
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return
-      setFixError(error instanceof Error ? error.message : 'The corrected SVG could not be prepared.')
+      if (contextIsCurrent()) {
+        const message = error instanceof Error ? error.message : 'The corrected SVG could not be prepared and reviewed.'
+        setFixError(`${message} The previous file and review are still shown.`)
+      }
     } finally {
-      setFixingActionId(null)
+      fixInFlight.current = false
+      if (fixOperationToken.current === operationToken) setFixingActionId(null)
     }
   }
 
@@ -326,10 +392,10 @@ export default function App() {
             file={file}
             fileHash={fileHash}
             maxUploadBytes={maxUploadBytes}
-            busy={busy}
-            onAssignmentChange={(id) => { setAssignmentId(id); clearResult() }}
+            busy={busy || correctionBusy}
+            onAssignmentChange={onAssignmentChange}
             onMaterialChange={onMaterialChange}
-            onThicknessChange={(value) => { setThicknessMm(value); clearResult() }}
+            onThicknessChange={onThicknessChange}
             onFileChange={onFileChange}
             onAnalyze={onAnalyze}
           />
@@ -343,7 +409,7 @@ export default function App() {
         ) : null}
 
         {report && counts ? (
-          <section className="results" id="review-results" tabIndex={-1} aria-label="File review results">
+          <section className="results" id="review-results" tabIndex={-1} aria-label="File review results" aria-busy={correctionBusy}>
             <div className={`readiness-banner ${reportReady ? 'is-ready' : hasBlockers ? 'needs-work' : demoProfile ? 'is-demo' : 'needs-work'}`}>
               <span className="readiness-icon" aria-hidden="true">
                 {reportReady ? <SparkIcon size={27} /> : <WarningIcon size={27} />}
@@ -386,10 +452,11 @@ export default function App() {
                   type="button"
                   className="secondary-button"
                   onClick={() => void onDownloadReport()}
+                  disabled={correctionBusy}
                 >
                   <DownloadIcon size={17} /> Download PDF report
                 </button>
-                <button type="button" className="icon-button" onClick={reset} title="Review another file" aria-label="Review another file">
+                <button type="button" className="icon-button" onClick={reset} disabled={correctionBusy} title="Review another file" aria-label="Review another file">
                   <ResetIcon size={18} />
                 </button>
               </div>

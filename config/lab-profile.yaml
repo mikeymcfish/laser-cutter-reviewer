@@ -1,7 +1,7 @@
 profile:
   id: epilog-classroom-demo
   name: Epilog Classroom Demo
-  version: 1.1.0
+  version: 1.2.0
   demo: true
 
 machine:
@@ -43,6 +43,7 @@ assignments:
         color: "#000000"
         stroke_width_mm: 0.0254
         stroke_tolerance_mm: 0.0005
+        stroke_lower_tolerance_mm: 0.00762
         require_closed: true
   - id: vector-trace
     name: Vector tracing exercise
@@ -60,6 +61,7 @@ assignments:
         color: "#000000"
         stroke_width_mm: 0.0254
         stroke_tolerance_mm: 0.0005
+        stroke_lower_tolerance_mm: 0.00762
         require_closed: true
   - id: open-studio
     name: Open studio
@@ -75,6 +77,7 @@ assignments:
         color: "#000000"
         stroke_width_mm: 0.0254
         stroke_tolerance_mm: 0.0005
+        stroke_lower_tolerance_mm: 0.00762
         require_closed: true
 
 materials:

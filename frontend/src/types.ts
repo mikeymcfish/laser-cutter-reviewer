@@ -162,16 +162,28 @@ export interface AnalysisCheck {
   [key: string]: unknown
 }
 
-export interface FixAction {
+interface FixActionBase {
   id: string
-  kind: 'normalize_cut_strokes'
   label: string
   description: string
+  endpoint?: string
   object_ids: string[]
   count: number
+}
+
+export interface NormalizeCutStrokesFixAction extends FixActionBase {
+  kind: 'normalize_cut_strokes'
   target_color: '#000000'
   target_stroke_width_in: 0.001
 }
+
+export interface SetArtboardFixAction extends FixActionBase {
+  kind: 'set_artboard'
+  target_width_in: number
+  target_height_in: number
+}
+
+export type FixAction = NormalizeCutStrokesFixAction | SetArtboardFixAction
 
 export interface PreviewPath {
   id: string
@@ -241,7 +253,7 @@ export interface AnalyzeSelection {
   thicknessMm: number
 }
 
-export interface FixStrokeSelection {
+export interface FixSelection {
   assignmentId: string
   expectedSha256: string
 }

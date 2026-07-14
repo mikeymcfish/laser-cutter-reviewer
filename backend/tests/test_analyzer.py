@@ -19,6 +19,33 @@ def test_equivalent_hairline_units_pass(client, stroke):
     assert check(report, "vectors.process_setup")["state"] == "pass"
 
 
+@pytest.mark.parametrize(
+    ("stroke_width_px", "expected_state"),
+    [
+        (".07008", "pass"),       # Illustrator export equivalent of 0.00073 in
+        (".0672", "pass"),        # inclusive configured lower bound: 0.00070 in
+        (".0671", "blocker"),     # below 0.00070 in
+        (".0978897", "pass"),     # inclusive target + 0.0005 mm upper tolerance
+        (".0979", "blocker"),     # above the existing narrow upper tolerance
+    ],
+)
+def test_illustrator_asymmetric_cut_width_range(client, stroke_width_px, expected_state):
+    data = svg_document(
+        f'<rect id="part" x="96" y="96" width="192" height="192" '
+        f'fill="none" stroke="#000000" stroke-width="{stroke_width_px}"/>'
+    )
+    report = post_svg(client, data).json()
+    process = check(report, "vectors.process_setup")
+    assert process["state"] == expected_state
+    assert any(
+        "target 0.00100 in" in evidence
+        and "accepted Illustrator export range 0.00070 in to 0.00102 in" in evidence
+        for evidence in process["evidence"]
+    )
+    path = next(item for item in report["geometry"]["paths"] if item["id"] == "part")
+    assert path["operation"] == ("cut" if expected_state == "pass" else "unassigned-vector")
+
+
 def test_inferred_and_unresolved_units(client):
     inferred = svg_document(
         '<rect x="10" y="10" width="100" height="100" fill="none" stroke="#000" stroke-width=".096"/>',

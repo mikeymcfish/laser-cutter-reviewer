@@ -1,15 +1,15 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 import * as api from './api'
 import * as pdfReport from './report'
-import type { AnalysisReport, ProfileResponse } from './types'
+import type { AnalysisReport, FixAction, ProfileResponse } from './types'
 
 vi.mock('./api', () => ({
   getProfile: vi.fn(),
   analyzeSvg: vi.fn(),
-  fixSvgStrokes: vi.fn(),
+  fixSvg: vi.fn(),
   sha256File: vi.fn(),
 }))
 
@@ -40,7 +40,7 @@ const profile: ProfileResponse = {
 }
 
 const report: AnalysisReport = {
-  report_version: '1.0',
+  report_version: '1.2',
   analyzed_at: '2026-07-14T14:30:00Z',
   file: { name: 'student.svg', size_bytes: 120, sha256: 'a'.repeat(64) },
   profile: { id: 'demo', name: 'Classroom', version: '1.0.0', demo: false },
@@ -95,8 +95,7 @@ describe('Laser Ready app', () => {
     vi.mocked(api.getProfile).mockResolvedValue(profile)
     vi.mocked(api.sha256File).mockResolvedValue('a'.repeat(64))
     vi.mocked(api.analyzeSvg).mockResolvedValue(report)
-    vi.mocked(api.fixSvgStrokes).mockResolvedValue(new Blob(['<svg/>'], { type: 'image/svg+xml' }))
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    vi.mocked(api.fixSvg).mockResolvedValue(new Blob(['<svg/>'], { type: 'image/svg+xml' }))
   })
 
   afterEach(() => {
@@ -150,19 +149,20 @@ describe('Laser Ready app', () => {
     expect(screen.queryByText(/\bmm\b/i)).not.toBeInTheDocument()
   })
 
-  it('downloads a fingerprint-bound corrected copy without replacing the analyzed original', async () => {
+  it('fixes through-cut strokes, downloads the copy, and refreshes the preview in one click', async () => {
     const user = userEvent.setup()
-    const action = {
+    const action: FixAction = {
       id: 'normalize-cut-strokes',
-      kind: 'normalize_cut_strokes' as const,
-      label: 'Download corrected SVG',
+      kind: 'normalize_cut_strokes',
+      endpoint: '/api/v1/fix-strokes',
+      label: 'Fix cut strokes',
       description: 'Change 2 highlighted cut strokes to RGB black (#000000) and 0.001 in.',
       object_ids: ['path-open', 'path-closed'],
       count: 2,
-      target_color: '#000000' as const,
-      target_stroke_width_in: 0.001 as const,
+      target_color: '#000000',
+      target_stroke_width_in: 0.001,
     }
-    vi.mocked(api.analyzeSvg).mockResolvedValue({
+    const initialReport: AnalysisReport = {
       ...report,
       checks: [{
         rule_id: 'vectors.process_setup',
@@ -174,7 +174,16 @@ describe('Laser Ready app', () => {
         bounds: [],
         fix_actions: [action],
       }],
-    })
+    }
+    const refreshedReport: AnalysisReport = {
+      ...report,
+      file: { ...report.file, name: 'student-cut-strokes-fixed.svg', sha256: 'b'.repeat(64) },
+      summary: { status: 'ready', counts: { blocker: 0, warning: 0, pass: 1, info: 0, unverified: 0 } },
+      checks: [{ ...report.checks[2], state: 'pass' }],
+      geometry: { ...report.geometry, paths: [], valid_3d: true, invalid_reason: null },
+    }
+    vi.mocked(api.analyzeSvg).mockResolvedValueOnce(initialReport).mockResolvedValueOnce(refreshedReport)
+    vi.mocked(api.sha256File).mockResolvedValueOnce('a'.repeat(64)).mockResolvedValueOnce('b'.repeat(64))
     const createObjectUrl = vi.fn(() => 'blob:corrected-svg')
     const revokeObjectUrl = vi.fn()
     const previousCreateObjectUrl = URL.createObjectURL
@@ -182,6 +191,7 @@ describe('Laser Ready app', () => {
     Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectUrl })
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectUrl })
     const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const confirm = vi.spyOn(window, 'confirm')
 
     try {
       const { container } = render(<App />)
@@ -191,21 +201,29 @@ describe('Laser Ready app', () => {
       await user.click(screen.getByRole('button', { name: 'Review my file' }))
       await user.click(await screen.findByRole('button', { name: /Cut color and hairline width/ }))
       expect(screen.getByText('Creates through-cuts: #000000 at 0.001 in')).toBeInTheDocument()
-      expect(screen.getByText(/intentional engraving, cancel/)).toBeInTheDocument()
-      expect(screen.getByText(/Your original stays unchanged/)).toBeInTheDocument()
+      expect(screen.getByText(/changes every highlighted stroke into a through-cut/)).toBeInTheDocument()
+      expect(screen.getByText(/immediately refreshes this preview/)).toBeInTheDocument()
 
-      await user.click(screen.getByRole('button', { name: /Download corrected SVG: change 2 strokes/ }))
-      expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('through-cuts (#000000 at 0.001 in)'))
-      expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('intentional engraving, choose Cancel'))
-      expect(await screen.findByText(/Corrected copy downloaded/)).toBeInTheDocument()
-      expect(api.fixSvgStrokes).toHaveBeenCalledWith(svg, {
+      await user.click(screen.getByRole('button', { name: /Fix 2 strokes by creating through-cuts/ }))
+      expect(await screen.findByText(/Through-cut strokes fixed/)).toBeInTheDocument()
+      expect(confirm).not.toHaveBeenCalled()
+      expect(api.fixSvg).toHaveBeenCalledWith(svg, action, {
         assignmentId: 'intro-svg',
         expectedSha256: 'a'.repeat(64),
+      })
+      const correctedFile = vi.mocked(api.analyzeSvg).mock.calls[1][0]
+      expect(correctedFile).toBeInstanceOf(File)
+      expect(correctedFile.name).toBe('student-cut-strokes-fixed.svg')
+      expect(api.sha256File).toHaveBeenLastCalledWith(correctedFile)
+      expect(api.analyzeSvg).toHaveBeenLastCalledWith(correctedFile, {
+        assignmentId: 'intro-svg',
+        materialId: 'birch-plywood',
+        thicknessMm: 3,
       })
       expect(createObjectUrl).toHaveBeenCalledWith(expect.any(Blob))
       expect(revokeObjectUrl).toHaveBeenCalledWith('blob:corrected-svg')
       expect((click.mock.instances[0] as unknown as HTMLAnchorElement).download).toBe('student-cut-strokes-fixed.svg')
-      expect(screen.getAllByText('student.svg').length).toBeGreaterThan(0)
+      expect(screen.getAllByText('student-cut-strokes-fixed.svg').length).toBeGreaterThan(0)
     } finally {
       click.mockRestore()
       Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: previousCreateObjectUrl })
@@ -213,43 +231,67 @@ describe('Laser Ready app', () => {
     }
   })
 
-  it('cancels automatic stroke conversion when the student declines the through-cut warning', async () => {
+  it('fixes only the artboard and immediately shows the refreshed 12 by 12 preview', async () => {
     const user = userEvent.setup()
-    vi.mocked(window.confirm).mockReturnValue(false)
-    vi.mocked(api.analyzeSvg).mockResolvedValue({
+    const action: FixAction = {
+      id: 'set-artboard',
+      kind: 'set_artboard',
+      endpoint: '/api/v1/fix-artboard',
+      label: 'Fix artboard',
+      description: 'Set the page to the assignment size without changing the artwork.',
+      object_ids: [],
+      count: 1,
+      target_width_in: 12,
+      target_height_in: 12,
+    }
+    const initialReport: AnalysisReport = {
       ...report,
+      document: { ...report.document, width_mm: 210, height_mm: 297 },
+      geometry: { ...report.geometry, page: { width_mm: 210, height_mm: 297 } },
       checks: [{
-        rule_id: 'vectors.process_setup',
-        title: 'Cut color and hairline width',
+        rule_id: 'document.size',
+        title: 'Artboard size',
         state: 'blocker',
-        message: 'One stroke is not set up as a cut.',
-        object_ids: ['path-open'],
+        message: 'The artboard does not match the assignment.',
+        object_ids: [],
         bounds: [],
-        fix_actions: [{
-          id: 'normalize-cut-strokes',
-          kind: 'normalize_cut_strokes',
-          label: 'Download corrected SVG',
-          description: 'Change the highlighted stroke to RGB black and 0.001 in.',
-          object_ids: ['path-open'],
-          count: 1,
-          target_color: '#000000',
-          target_stroke_width_in: 0.001,
-        }],
+        fix_actions: [action],
       }],
-    })
-    const { container } = render(<App />)
-    await screen.findByText('Tell us what you’re making')
-    await user.upload(
-      container.querySelector<HTMLInputElement>('input[type="file"]')!,
-      new File(['<svg/>'], 'student.svg', { type: 'image/svg+xml' }),
-    )
-    await user.click(screen.getByRole('button', { name: 'Review my file' }))
-    await user.click(await screen.findByRole('button', { name: /Cut color and hairline width/ }))
-    await user.click(screen.getByRole('button', { name: /Download corrected SVG: change 1 stroke/ }))
-
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('1 highlighted stroke'))
-    expect(api.fixSvgStrokes).not.toHaveBeenCalled()
-    expect(screen.queryByText(/Corrected copy downloaded/)).not.toBeInTheDocument()
+    }
+    const refreshedReport: AnalysisReport = {
+      ...report,
+      file: { ...report.file, name: 'student-artboard-fixed.svg', sha256: 'b'.repeat(64) },
+      summary: { status: 'ready', counts: { blocker: 0, warning: 0, pass: 1, info: 0, unverified: 0 } },
+      checks: [{ ...report.checks[2], state: 'pass' }],
+      geometry: { ...report.geometry, page: { width_mm: 304.8, height_mm: 304.8 } },
+    }
+    vi.mocked(api.analyzeSvg).mockResolvedValueOnce(initialReport).mockResolvedValueOnce(refreshedReport)
+    vi.mocked(api.sha256File).mockResolvedValueOnce('a'.repeat(64)).mockResolvedValueOnce('b'.repeat(64))
+    const previousCreateObjectUrl = URL.createObjectURL
+    const previousRevokeObjectUrl = URL.revokeObjectURL
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => 'blob:artboard') })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    try {
+      const { container } = render(<App />)
+      await screen.findByText('Tell us what you’re making')
+      await user.upload(container.querySelector<HTMLInputElement>('input[type="file"]')!, new File(['<svg/>'], 'student.svg', { type: 'image/svg+xml' }))
+      await user.click(screen.getByRole('button', { name: 'Review my file' }))
+      await user.click(await screen.findByRole('button', { name: /Artboard size/ }))
+      expect(screen.getByText('Changes the page only to 12 × 12 in')).toBeInTheDocument()
+      expect(screen.getByText(/anchored at the top-left.*not scaled or moved/)).toBeInTheDocument()
+      await user.click(screen.getByRole('button', { name: /Fix artboard page only to 12 × 12 in/ }))
+      expect(await screen.findByText(/Artboard fixed/)).toBeInTheDocument()
+      expect(api.fixSvg).toHaveBeenCalledWith(expect.any(File), action, expect.objectContaining({ expectedSha256: 'a'.repeat(64) }))
+      expect(api.analyzeSvg).toHaveBeenCalledTimes(2)
+      expect(screen.getAllByText('12 × 12 in').length).toBeGreaterThan(0)
+      expect(screen.getAllByText('student-artboard-fixed.svg').length).toBeGreaterThan(0)
+      expect((click.mock.instances[0] as unknown as HTMLAnchorElement).download).toBe('student-artboard-fixed.svg')
+    } finally {
+      click.mockRestore()
+      Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: previousCreateObjectUrl })
+      Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: previousRevokeObjectUrl })
+    }
   })
 
   it('announces a corrected-copy service error without clearing the report', async () => {
@@ -275,7 +317,7 @@ describe('Laser Ready app', () => {
         }],
       }],
     })
-    vi.mocked(api.fixSvgStrokes).mockRejectedValue(new Error('Correction could not preserve this transformed stroke.'))
+    vi.mocked(api.fixSvg).mockRejectedValue(new Error('Correction could not preserve this transformed stroke.'))
     const { container } = render(<App />)
     await screen.findByText('Tell us what you’re making')
     await user.upload(
@@ -284,9 +326,60 @@ describe('Laser Ready app', () => {
     )
     await user.click(screen.getByRole('button', { name: 'Review my file' }))
     await user.click(await screen.findByRole('button', { name: /Cut color and hairline width/ }))
-    await user.click(screen.getByRole('button', { name: /Download corrected SVG: change 1 stroke/ }))
+    await user.click(screen.getByRole('button', { name: /Fix 1 stroke by creating through-cuts/ }))
     expect(await screen.findByRole('alert')).toHaveTextContent('Correction could not preserve this transformed stroke.')
+    expect(screen.getByRole('alert')).toHaveTextContent('The previous file and review are still shown.')
     expect(screen.getByRole('heading', { name: '1 blocker to fix' })).toBeInTheDocument()
+  })
+
+  it('suppresses rapid duplicate fixes and never installs a stale result after the review context changes', async () => {
+    const user = userEvent.setup()
+    const action: FixAction = {
+      id: 'normalize-cut-strokes',
+      kind: 'normalize_cut_strokes',
+      label: 'Fix cut stroke',
+      description: 'Change one intended cut stroke to the required process.',
+      object_ids: ['path-open'],
+      count: 1,
+      target_color: '#000000',
+      target_stroke_width_in: 0.001,
+    }
+    const initialReport: AnalysisReport = {
+      ...report,
+      checks: [{
+        rule_id: 'vectors.process_setup',
+        title: 'Cut color and hairline width',
+        state: 'blocker',
+        message: 'One cut stroke is the wrong color.',
+        fix_actions: [action],
+      }],
+    }
+    let resolveFix!: (value: Blob) => void
+    vi.mocked(api.analyzeSvg).mockResolvedValueOnce(initialReport)
+    vi.mocked(api.fixSvg).mockReturnValue(new Promise((resolve) => { resolveFix = resolve }))
+
+    const { container } = render(<App />)
+    await screen.findByText('Tell us what you’re making')
+    await user.upload(container.querySelector<HTMLInputElement>('input[type="file"]')!, new File(['<svg/>'], 'student.svg', { type: 'image/svg+xml' }))
+    await user.click(screen.getByRole('button', { name: 'Review my file' }))
+    await user.click(await screen.findByRole('button', { name: /Cut color and hairline width/ }))
+    const fixButton = screen.getByRole('button', { name: /Fix 1 stroke by creating through-cuts/ })
+
+    fireEvent.click(fixButton)
+    fireEvent.click(fixButton)
+    expect(api.fixSvg).toHaveBeenCalledTimes(1)
+    expect(screen.getByLabelText('Assignment')).toBeDisabled()
+
+    // Simulate an out-of-band context replacement while the service response is pending.
+    const assignment = screen.getByLabelText('Assignment')
+    assignment.removeAttribute('disabled')
+    fireEvent.change(assignment, { target: { value: 'vector-trace' } })
+    await act(async () => resolveFix(new Blob(['<svg/>'], { type: 'image/svg+xml' })))
+
+    await waitFor(() => expect(screen.queryByLabelText('File review results')).not.toBeInTheDocument())
+    expect(api.analyzeSvg).toHaveBeenCalledTimes(1)
+    expect(api.sha256File).toHaveBeenCalledTimes(1)
+    expect(screen.queryByText('student-cut-strokes-fixed.svg')).not.toBeInTheDocument()
   })
 
   it('never marks a demo profile ready even with no blockers', async () => {

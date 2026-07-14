@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { analyzeSvg, fixSvgStrokes, getProfile } from './api'
+import { analyzeSvg, fixSvg, getProfile } from './api'
+import type { FixAction } from './types'
 
 describe('API client', () => {
   afterEach(() => vi.unstubAllGlobals())
 
   it('sends the SVG and all review selections as multipart fields', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ report_version: '1.0' }) })
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ report_version: '1.2' }) })
     vi.stubGlobal('fetch', fetchMock)
     const file = new File(['<svg/>'], 'part.svg', { type: 'image/svg+xml' })
 
@@ -37,7 +38,18 @@ describe('API client', () => {
     vi.stubGlobal('fetch', fetchMock)
     const file = new File(['<svg/>'], 'part.svg', { type: 'image/svg+xml' })
 
-    await expect(fixSvgStrokes(file, {
+    const action: FixAction = {
+      id: 'normalize-cut-strokes',
+      kind: 'normalize_cut_strokes',
+      endpoint: 'https://attacker.example/steal',
+      label: 'Fix cut strokes',
+      description: 'Normalize intended cut strokes.',
+      object_ids: ['cut-1'],
+      count: 1,
+      target_color: '#000000',
+      target_stroke_width_in: 0.001,
+    }
+    await expect(fixSvg(file, action, {
       assignmentId: 'intro-svg',
       expectedSha256: 'a'.repeat(64),
     })).resolves.toBe(corrected)
@@ -51,4 +63,44 @@ describe('API client', () => {
     expect(body.get('assignment_id')).toBe('intro-svg')
     expect(body.get('expected_sha256')).toBe('a'.repeat(64))
   })
+
+  it('dispatches an artboard fix only to its allowlisted same-origin endpoint', async () => {
+    const corrected = new Blob(['<svg width="12in" height="12in"/>'], { type: 'image/svg+xml' })
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, blob: async () => corrected })
+    vi.stubGlobal('fetch', fetchMock)
+    const action: FixAction = {
+      id: 'set-artboard',
+      kind: 'set_artboard',
+      endpoint: '//attacker.example/steal',
+      label: 'Fix artboard',
+      description: 'Set page size.',
+      object_ids: [],
+      count: 1,
+      target_width_in: 12,
+      target_height_in: 12,
+    }
+
+    await fixSvg(new File(['<svg/>'], 'part.svg'), action, {
+      assignmentId: 'intro-svg',
+      expectedSha256: 'b'.repeat(64),
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/fix-artboard', expect.objectContaining({ method: 'POST' }))
+    expect(fetchMock).not.toHaveBeenCalledWith(expect.stringContaining('attacker.example'), expect.anything())
+  })
+
+  it.each(['open_redirect', 'constructor', 'toString', '__proto__'])(
+    'rejects the runtime correction kind %s without making a request',
+    async (kind) => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const unsupported = { kind, endpoint: 'https://attacker.example' } as unknown as FixAction
+
+    await expect(fixSvg(new File(['<svg/>'], 'part.svg'), unsupported, {
+      assignmentId: 'intro-svg',
+      expectedSha256: 'c'.repeat(64),
+    })).rejects.toThrow('not supported')
+    expect(fetchMock).not.toHaveBeenCalled()
+    },
+  )
 })

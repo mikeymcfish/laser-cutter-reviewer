@@ -9,7 +9,7 @@ describe('Checklist correction actions', () => {
     const action = {
       id: 'normalize-cut-strokes',
       kind: 'normalize_cut_strokes' as const,
-      label: 'Download corrected SVG',
+      label: 'Fix cut stroke',
       description: 'Change the highlighted stroke to RGB black (#000000) and 0.001 in.',
       object_ids: ['wrong-stroke'],
       count: 1,
@@ -33,12 +33,47 @@ describe('Checklist correction actions', () => {
 
     expect(container.querySelector('button button')).toBeNull()
     expect(screen.getByRole('button', { name: /Cut color and hairline width/ })).toHaveAttribute('aria-expanded', 'true')
-    const fixButton = screen.getByRole('button', { name: /Download corrected SVG: change 1 stroke/ })
+    const fixButton = screen.getByRole('button', { name: /Fix 1 stroke by creating through-cuts/ })
     expect(screen.getByText('Creates through-cuts: #000000 at 0.001 in')).toBeInTheDocument()
-    expect(screen.getByText(/intentional engraving, cancel/)).toBeInTheDocument()
-    expect(screen.getByText(/Your original stays unchanged/)).toBeInTheDocument()
+    expect(screen.getByText(/changes every highlighted stroke into a through-cut/)).toBeInTheDocument()
+    expect(screen.getByText(/immediately refreshes this preview/)).toBeInTheDocument()
     fireEvent.click(fixButton)
     expect(onFixAction).toHaveBeenCalledWith(action)
     expect(onSelect).not.toHaveBeenCalled()
+  })
+
+  it('states that an artboard fix anchors the page without changing artwork', () => {
+    const onFixAction = vi.fn()
+    const action = {
+      id: 'set-artboard',
+      kind: 'set_artboard' as const,
+      endpoint: '/api/v1/fix-artboard',
+      label: 'Fix artboard',
+      description: 'Set the page to the required assignment size.',
+      object_ids: [],
+      count: 1,
+      target_width_in: 12,
+      target_height_in: 12,
+    }
+    render(
+      <Checklist
+        checks={[{
+          rule_id: 'document.size',
+          title: 'Artboard size',
+          state: 'blocker',
+          message: 'The page is the wrong size.',
+          fix_actions: [action],
+        }]}
+        selectedId="document.size"
+        onSelect={vi.fn()}
+        onFixAction={onFixAction}
+      />,
+    )
+
+    expect(screen.getByText('Changes the page only to 12 × 12 in')).toBeInTheDocument()
+    expect(screen.getByText(/anchored at the top-left.*not scaled or moved/)).toBeInTheDocument()
+    const button = screen.getByRole('button', { name: /Fix artboard page only to 12 × 12 in/ })
+    fireEvent.click(button)
+    expect(onFixAction).toHaveBeenCalledWith(action)
   })
 })

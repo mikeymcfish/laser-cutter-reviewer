@@ -298,6 +298,9 @@ def test_unapproved_materials_are_not_public_and_metric_name_is_stable(client, g
         lambda data: data["limits"].update(max_fixable_cut_stroke_width_mm=0),
         lambda data: data["limits"].update(max_total_embedded_image_pixels=0),
         lambda data: data["limits"].update(max_embedded_images=0),
+        lambda data: data["assignments"][0]["processes"][0].update(
+            stroke_lower_tolerance_mm=data["assignments"][0]["processes"][0]["stroke_width_mm"]
+        ),
     ],
 )
 def test_core_profile_validation_rejects_invalid_configuration(mutate):

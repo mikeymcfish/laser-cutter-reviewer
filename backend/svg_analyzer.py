@@ -127,10 +127,21 @@ class StrokeFixError(SVGAnalysisError):
     """A safe, student-facing reason a corrected copy cannot be produced."""
 
 
+class ArtboardFixError(SVGAnalysisError):
+    """A safe, student-facing reason an artboard-corrected copy cannot be produced."""
+
+
 @dataclass
 class FixedSVG:
     data: bytes
     changed_source_ids: list[str]
+
+
+@dataclass
+class FixedArtboardSVG:
+    data: bytes
+    target_width_mm: float
+    target_height_mm: float
 
 
 @dataclass
@@ -180,6 +191,19 @@ def _format_inches(value_mm: float, digits: int = 4) -> str:
 
 def _format_square_inches(value_mm2: float, digits: int = 4) -> str:
     return f"{value_mm2 / (25.4 * 25.4):.{digits}f} in\u00b2"
+
+
+def _process_stroke_range_mm(process: ProcessProfile) -> tuple[float, float]:
+    """Return the configured inclusive process range, preserving legacy symmetry."""
+    return (
+        process.stroke_width_mm - process.effective_lower_tolerance_mm,
+        process.stroke_width_mm + process.stroke_tolerance_mm,
+    )
+
+
+def _matches_process_stroke(stroke_width_mm: float, process: ProcessProfile) -> bool:
+    lower_mm, upper_mm = _process_stroke_range_mm(process)
+    return lower_mm - 1e-12 <= stroke_width_mm <= upper_mm + 1e-12
 
 
 def _sanitize_preserve_aspect_ratio(value: str | None) -> str:
@@ -1255,7 +1279,7 @@ def _extract_paths(
         ambiguous = (meta.ambiguous_transform if meta else False) or matrix_ambiguous
         approved_process = None
         for process in assignment.processes:
-            if color == process.color and abs(stroke_width_mm - process.stroke_width_mm) <= process.stroke_tolerance_mm:
+            if color == process.color and _matches_process_stroke(stroke_width_mm, process):
                 approved_process = process
                 break
         configured_process_color = any(color == process.color for process in assignment.processes)
@@ -1630,6 +1654,275 @@ def _set_inline_cut_style(element: StdET.Element) -> None:
     element.set("vector-effect", "non-scaling-stroke")
 
 
+def _artboard_scale_mm_per_unit(scale: DocumentScale) -> tuple[float, float] | None:
+    """Return reliable viewport scales for an explicit, non-distorting document."""
+    if (
+        scale.confidence != "explicit"
+        or scale.width_mm is None
+        or scale.height_mm is None
+        or scale.viewbox is None
+    ):
+        return None
+    x_scale = scale.width_mm / scale.viewbox[2]
+    y_scale = scale.height_mm / scale.viewbox[3]
+    if (
+        not math.isfinite(x_scale)
+        or not math.isfinite(y_scale)
+        or x_scale <= 0
+        or y_scale <= 0
+        or not math.isclose(x_scale, y_scale, rel_tol=1e-7, abs_tol=1e-10)
+    ):
+        return None
+    return x_scale, y_scale
+
+
+def _root_aspect_ratio_is_reliable(root: StdET.Element) -> bool:
+    raw = " ".join((root.get("preserveAspectRatio") or "").split())
+    if not raw:
+        return True
+    if raw == "none":
+        return True
+    parts = raw.split()
+    return bool(
+        (len(parts) == 1 and parts[0] in PRESERVE_ASPECT_RATIO_ALIGNMENTS)
+        or (
+            len(parts) == 2
+            and parts[0] in PRESERVE_ASPECT_RATIO_ALIGNMENTS
+            and parts[1] in {"meet", "slice"}
+        )
+    )
+
+
+def _root_viewport_styles_match(
+    root: StdET.Element,
+    rules: list[tuple[str, dict[str, str]]],
+    scale: DocumentScale,
+) -> bool:
+    """Reject a CSS viewport that disagrees with the physical root attributes."""
+    styled = _style_for(root, {}, rules)
+    for key, expected_mm in (("width", scale.width_mm), ("height", scale.height_mm)):
+        if key not in styled:
+            continue
+        measured_mm, _, explicit = _parse_length(styled[key])
+        if (
+            not explicit
+            or measured_mm is None
+            or expected_mm is None
+            or not math.isclose(measured_mm, expected_mm, rel_tol=1e-9, abs_tol=1e-7)
+        ):
+            return False
+    return True
+
+
+def _svg_number(value: float) -> str:
+    text = format(value, ".15g")
+    return "0" if text in {"-0", "-0.0"} else text
+
+
+def _set_artboard_viewport(
+    root: StdET.Element,
+    *,
+    target_width_mm: float,
+    target_height_mm: float,
+    viewbox: tuple[float, float, float, float],
+    x_scale_mm_per_unit: float,
+    y_scale_mm_per_unit: float,
+) -> None:
+    width_in = _svg_number(target_width_mm / 25.4)
+    height_in = _svg_number(target_height_mm / 25.4)
+    new_viewbox_width = target_width_mm / x_scale_mm_per_unit
+    new_viewbox_height = target_height_mm / y_scale_mm_per_unit
+    root.set("width", f"{width_in}in")
+    root.set("height", f"{height_in}in")
+    root.set(
+        "viewBox",
+        " ".join(
+            _svg_number(value)
+            for value in (viewbox[0], viewbox[1], new_viewbox_width, new_viewbox_height)
+        ),
+    )
+    root.attrib.pop("viewbox", None)
+    declarations = _declarations(root.get("style"))
+    declarations.update({"width": f"{width_in}in", "height": f"{height_in}in"})
+    root.set("style", ";".join(f"{key}:{value}" for key, value in declarations.items()))
+
+
+def _same_optional_number(left: float | None, right: float | None, tolerance: float = 1e-4) -> bool:
+    if left is None or right is None:
+        return left is right
+    return math.isclose(left, right, rel_tol=1e-9, abs_tol=tolerance)
+
+
+def _same_bounds(left: Bounds | None, right: Bounds | None) -> bool:
+    if left is None or right is None:
+        return left is right
+    return all(
+        _same_optional_number(getattr(left, name), getattr(right, name))
+        for name in ("x_mm", "y_mm", "width_mm", "height_mm")
+    )
+
+
+def _normalized_geometry_is_unchanged(
+    before: list[ExtractedPath], after: list[ExtractedPath]
+) -> bool:
+    """Prove each normalized vector/raster placement stayed at the same physical coordinates."""
+    if len(before) != len(after):
+        return False
+    for left, right in zip(before, after):
+        if (
+            left.source_id != right.source_id
+            or left.preview.id != right.preview.id
+            or left.preview.z_index != right.preview.z_index
+            or left.preview.operation != right.preview.operation
+            or left.preview.closed != right.preview.closed
+            or left.color != right.color
+            or left.fill != right.fill
+            or left.dash != right.dash
+            or left.ambiguous_transform != right.ambiguous_transform
+            or not _same_optional_number(
+                left.preview.stroke_width_mm, right.preview.stroke_width_mm
+            )
+            or not _same_bounds(left.preview.bounds, right.preview.bounds)
+            or len(left.preview.points) != len(right.preview.points)
+        ):
+            return False
+        for left_point, right_point in zip(left.preview.points, right.preview.points):
+            if len(left_point) != len(right_point) or any(
+                not math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-4)
+                for a, b in zip(left_point, right_point)
+            ):
+                return False
+    return True
+
+
+def _paths_for_fix_verification(
+    root: StdET.Element,
+    metadata: dict[str, ElementMeta],
+    assignment: AssignmentProfile,
+    profile: LabProfile,
+) -> list[ExtractedPath]:
+    analysis_root = StdET.fromstring(StdET.tostring(root, encoding="utf-8"))
+    _neutralize_image_payloads(analysis_root)
+    paths, _, _ = _extract_paths(
+        StdET.tostring(analysis_root, encoding="unicode"),
+        metadata,
+        assignment,
+        profile.machine.vector_hairline_threshold_mm,
+        profile.limits,
+    )
+    return paths
+
+
+def fix_artboard(
+    *,
+    data: bytes,
+    expected_sha256: str,
+    profile: LabProfile,
+    assignment: AssignmentProfile,
+) -> FixedArtboardSVG:
+    """Return a verified copy with only the exact-assignment viewport enlarged or reduced."""
+    actual_sha256 = hashlib.sha256(data).hexdigest()
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256) or actual_sha256 != expected_sha256.lower():
+        raise ArtboardFixError(
+            "The selected SVG no longer matches the analyzed file. Analyze it again before correcting the artboard."
+        )
+    if (
+        assignment.page_policy != "exact"
+        or assignment.expected_width_mm is None
+        or assignment.expected_height_mm is None
+    ):
+        raise ArtboardFixError("This assignment does not define one exact artboard size.")
+
+    root, _ = _validate_xml_safety(data, profile.limits)
+    if any(_local_name(element.tag).lower() in {"use", "text"} for element in root.iter()):
+        raise ArtboardFixError(
+            "Automatic artboard correction is unavailable for SVGs with reusable <use> or live text geometry."
+        )
+    scale = _document_scale(root)
+    original_scales = _artboard_scale_mm_per_unit(scale)
+    if original_scales is None or not _root_aspect_ratio_is_reliable(root):
+        raise ArtboardFixError(
+            "The SVG needs explicit physical width and height, a valid viewBox, and matching horizontal and vertical scale before its artboard can be corrected safely."
+        )
+    if (
+        abs((scale.width_mm or 0) - assignment.expected_width_mm) <= assignment.page_tolerance_mm
+        and abs((scale.height_mm or 0) - assignment.expected_height_mm) <= assignment.page_tolerance_mm
+    ):
+        raise ArtboardFixError("The SVG artboard already matches the assignment size.")
+
+    rules, unsupported_css = _css_rules(root)
+    if not _root_viewport_styles_match(root, rules, scale):
+        raise ArtboardFixError(
+            "CSS width or height conflicts with the SVG's physical viewport, so the artboard cannot be corrected safely."
+        )
+    metadata, unsupported_effects, _, duplicate_source_ids = _collect_metadata(root, rules)
+    _, external_images, invalid_images = _image_inventory(root, metadata, profile.limits)
+    if duplicate_source_ids:
+        raise ArtboardFixError("Duplicate object IDs make artboard verification unreliable.")
+    if unsupported_css or unsupported_effects:
+        raise ArtboardFixError("Unsupported SVG effects or CSS make artboard verification unreliable.")
+    if external_images or invalid_images:
+        raise ArtboardFixError("Embed or replace every raster image before correcting the artboard.")
+
+    before_paths = _paths_for_fix_verification(root, metadata, assignment, profile)
+    _set_artboard_viewport(
+        root,
+        target_width_mm=assignment.expected_width_mm,
+        target_height_mm=assignment.expected_height_mm,
+        viewbox=scale.viewbox,  # type: ignore[arg-type]
+        x_scale_mm_per_unit=original_scales[0],
+        y_scale_mm_per_unit=original_scales[1],
+    )
+    for element in root.iter():
+        element_id = element.get("id")
+        if element_id and metadata.get(element_id) and metadata[element_id].generated_id:
+            element.attrib.pop("id", None)
+
+    StdET.register_namespace("", "http://www.w3.org/2000/svg")
+    fixed_data = StdET.tostring(root, encoding="utf-8", xml_declaration=True)
+    if len(fixed_data) > profile.limits.max_upload_bytes:
+        raise ArtboardFixError("The artboard-corrected SVG would exceed the upload size limit.")
+
+    verify_root, _ = _validate_xml_safety(fixed_data, profile.limits)
+    verify_scale = _document_scale(verify_root)
+    verify_scales = _artboard_scale_mm_per_unit(verify_scale)
+    if (
+        verify_scales is None
+        or verify_scale.width_mm is None
+        or verify_scale.height_mm is None
+        or verify_scale.viewbox is None
+        or abs(verify_scale.width_mm - assignment.expected_width_mm) > 1e-7
+        or abs(verify_scale.height_mm - assignment.expected_height_mm) > 1e-7
+        or not math.isclose(verify_scale.viewbox[0], scale.viewbox[0], rel_tol=0, abs_tol=1e-10)  # type: ignore[index]
+        or not math.isclose(verify_scale.viewbox[1], scale.viewbox[1], rel_tol=0, abs_tol=1e-10)  # type: ignore[index]
+        or not math.isclose(verify_scales[0], original_scales[0], rel_tol=1e-9, abs_tol=1e-11)
+        or not math.isclose(verify_scales[1], original_scales[1], rel_tol=1e-9, abs_tol=1e-11)
+    ):
+        raise ArtboardFixError("The corrected artboard did not preserve the original physical scale.")
+    verify_rules, verify_css = _css_rules(verify_root)
+    verify_metadata, verify_effects, _, verify_duplicates = _collect_metadata(verify_root, verify_rules)
+    _, verify_external_images, verify_invalid_images = _image_inventory(
+        verify_root, verify_metadata, profile.limits
+    )
+    if (
+        verify_css
+        or verify_effects
+        or verify_duplicates
+        or verify_external_images
+        or verify_invalid_images
+        or not _root_viewport_styles_match(verify_root, verify_rules, verify_scale)
+    ):
+        raise ArtboardFixError("The artboard-corrected SVG did not pass safety verification.")
+    after_paths = _paths_for_fix_verification(verify_root, verify_metadata, assignment, profile)
+    if not _normalized_geometry_is_unchanged(before_paths, after_paths):
+        raise ArtboardFixError("The artboard correction would move or scale artwork, so no copy was created.")
+    return FixedArtboardSVG(
+        data=fixed_data,
+        target_width_mm=assignment.expected_width_mm,
+        target_height_mm=assignment.expected_height_mm,
+    )
+
+
 def fix_strokes(
     *,
     data: bytes,
@@ -1746,6 +2039,9 @@ def analyze_svg(
     try:
         root, _ = _validate_xml_safety(data, profile.limits)
         has_use_elements = any(_local_name(element.tag).lower() == "use" for element in root.iter())
+        has_live_text_elements = any(
+            _local_name(element.tag).lower() == "text" for element in root.iter()
+        )
         scale = _document_scale(root)
         rules, unsupported_css = _css_rules(root)
         metadata, unsupported_effects, hidden_count, duplicate_source_ids = _collect_metadata(root, rules)
@@ -1931,6 +2227,38 @@ def analyze_svg(
             scale.width_mm <= profile.machine.usable_width_mm + assignment.page_tolerance_mm
             and scale.height_mm <= profile.machine.usable_height_mm + assignment.page_tolerance_mm
         )
+    can_offer_artboard_fix = bool(
+        not page_ok
+        and assignment.page_policy == "exact"
+        and _artboard_scale_mm_per_unit(scale) is not None
+        and _root_aspect_ratio_is_reliable(root)
+        and _root_viewport_styles_match(root, rules, scale)
+        and not duplicate_source_ids
+        and not effects
+        and not external_images
+        and not invalid_images
+        and not has_use_elements
+        and not has_live_text_elements
+    )
+    artboard_fix_actions = [
+        FixAction(
+            id="set-artboard",
+            kind="set_artboard",
+            label=(
+                f"Set artboard to {_format_inches(assignment.expected_width_mm or 0)} x "
+                f"{_format_inches(assignment.expected_height_mm or 0)}"
+            ),
+            description=(
+                "Creates a separate SVG copy with the assignment artboard size while preserving "
+                "the artwork's physical scale and coordinates. The original file is unchanged."
+            ),
+            endpoint="/api/v1/fix-artboard",
+            object_ids=[],
+            count=1,
+            target_width_in=_round((assignment.expected_width_mm or 0) / 25.4, 6),
+            target_height_in=_round((assignment.expected_height_mm or 0) / 25.4, 6),
+        )
+    ] if can_offer_artboard_fix else []
     _add_check(
         checks,
         rule_id="document.page_size",
@@ -1939,6 +2267,7 @@ def analyze_svg(
         message="The artboard matches the assignment policy." if page_ok else "The artboard does not match the assignment page policy.",
         evidence=page_evidence or ["Physical artboard size is unresolved."],
         fix=None if page_ok else "Set the Illustrator artboard to the assignment size, then export the SVG again.",
+        fix_actions=artboard_fix_actions,
     )
 
     outside_ids: list[str] = []
@@ -1977,10 +2306,21 @@ def analyze_svg(
     ambiguous_vectors = [item for item in approved_paths + unassigned_vectors if item.ambiguous_transform]
     process_bad = list({item.preview.id: item for item in unassigned_vectors + dashed_cuts + ambiguous_vectors}.values())
     process_evidence = [
+        (
+            f"{process.name}: target {_format_inches(process.stroke_width_mm, 5)}; "
+            f"accepted Illustrator export range "
+            f"{_format_inches(_process_stroke_range_mm(process)[0], 5)} to "
+            f"{_format_inches(_process_stroke_range_mm(process)[1], 5)}"
+        )
+        for process in assignment.processes
+    ]
+    process_evidence.extend(
+        [
         f"{item.preview.id}: stroke {item.color}, width "
         f"{_format_inches(item.preview.stroke_width_mm or 0, 5)}"
         for item in unassigned_vectors[:20]
-    ]
+        ]
+    )
     process_evidence.extend(f"{item.preview.id}: dashed cut stroke" for item in dashed_cuts[:20])
     process_evidence.extend(f"{item.preview.id}: non-uniform/skewed stroke transform" for item in ambiguous_vectors[:20])
     if not approved_paths:
@@ -2010,13 +2350,17 @@ def analyze_svg(
     process_fix_actions = [
         FixAction(
             id="normalize-cut-strokes",
+            kind="normalize_cut_strokes",
             label=f"Download a corrected copy ({len(fixable_paths)} stroke(s))",
             description=(
                 "Creates a separate SVG copy with the highlighted likely-cut strokes set to "
                 "black, 0.001 in, and non-scaling. The original file is unchanged."
             ),
+            endpoint="/api/v1/fix-strokes",
             object_ids=[item.preview.id for item in fixable_paths],
             count=len(fixable_paths),
+            target_color="#000000",
+            target_stroke_width_in=0.001,
         )
     ] if can_offer_stroke_fix else []
     _add_check(

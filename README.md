@@ -13,7 +13,7 @@ short_description: Student SVG preflight for Epilog laser cutter projects
 
 Laser Cutter Reviewer is a student-facing preflight tool for Adobe Illustrator SVG exports. It checks document setup, vector cut geometry, embedded resources, and material-dependent risk indicators before a file reaches the instructor. The classroom assignments default to a 12 x 12 inch artboard, and physical measurements are presented in inches while the analyzer continues to normalize geometry internally in millimeters. Results include an annotated 2D view, an approximate material preview, and a fingerprinted PDF report.
 
-The app never changes the uploaded original, sets laser power/speed, or certifies that a job is safe to run. When the analyzer identifies eligible cut strokes with the wrong color or width, a student may explicitly download a separate corrected SVG that normalizes only those identified strokes to `#000000` and `0.001in`. The corrected copy must be uploaded and reviewed again; it is not automatically accepted or substituted for the original. “Ready for teacher review” only means that the automated profile checks found no blockers. An instructor must still inspect the file, material, machine settings, ventilation, focus, placement, and supervision requirements.
+The app never changes the uploaded original, sets laser power/speed, or certifies that a job is safe to run. When the analyzer offers a correction, one click downloads a separate corrected SVG and immediately runs that copy through the full review again so its updated preview and findings appear in the app. Eligible stroke corrections normalize only the identified likely cut strokes to `#000000` and `0.001in`; eligible artboard corrections set the assignment page size without scaling or moving the artwork. “Ready for teacher review” only means that the automated profile checks found no blockers. An instructor must still inspect the file, material, machine settings, ventilation, focus, placement, and supervision requirements.
 
 ## Privacy and security
 
@@ -27,11 +27,13 @@ The app never changes the uploaded original, sets laser power/speed, or certifie
 
 Deploying a public Space sends files to Hugging Face infrastructure for transient processing. Confirm that this is compatible with school policy before inviting students to use it.
 
-## Version 1.1 scope
+## Version 1.2 scope
 
 - SVG is the only accepted file format, with Adobe Illustrator exports as the primary target.
 - Classroom assignments use a 12 x 12 inch default artboard, and student-facing measurements default to inches.
-- The uploaded original is read-only. Stroke correction is an explicit, confirmed download of a separate SVG containing only analyzer-identified likely cut-stroke normalization to pure RGB black (`#000000`) and `0.001in`; the student must re-upload that copy for a complete review. Automatic correction is limited to plausible cut widths up to `0.010in` and is disabled for documents with shared `<use>` geometry, CSS priorities, ambiguous transforms, unsafe effects, or unresolved resources so intentional engraving is not silently converted.
+- The configured through-cut target remains exactly `0.001in`. To accommodate Illustrator SVG export rounding observed in classroom files, the demo profile accepts physical cut strokes from `0.00070in` through approximately `0.00102in`; the lower and upper tolerances are configured separately in the lab profile.
+- The uploaded original is read-only. A one-click stroke correction downloads a separate SVG containing only analyzer-identified likely cut-stroke normalization to pure RGB black (`#000000`) and `0.001in`, then immediately analyzes and previews that corrected copy. Automatic correction is limited to plausible cut widths up to `0.010in` and is disabled for documents with shared `<use>` geometry, CSS priorities, ambiguous transforms, unsafe effects, or unresolved resources so intentional engraving is not silently converted.
+- For exact-size assignments, an eligible one-click artboard correction downloads a separate SVG and immediately re-reviews it. The corrected artboard is anchored at the existing top-left/viewBox origin and preserves the artwork's physical scale and coordinates; making a page smaller can therefore reveal out-of-page artwork. The fix is conservatively withheld when viewport mapping or geometry cannot be proven stable.
 - Embedded raster images can appear in the sanitized 2D preview as multiply-blended layers. Linked images remain blocked because their pixel data is absent from the SVG.
 - Packing/nesting is intentionally deferred. A future packer must preserve the original and export a separate packed SVG.
 - The 3D view is an approximate inspection aid; it cannot infer keep-versus-scrap, assembly intent, charring, or real strength.
@@ -110,7 +112,8 @@ In PowerShell, set the environment variable with `$env:LASER_REVIEWER_FRONTEND_D
 - `GET /healthz` — liveness/readiness check.
 - `GET /api/v1/profile` — public machine, assignment, and material choices.
 - `POST /api/v1/analyze` — multipart SVG analysis with assignment, material, and thickness selections.
-- `POST /api/v1/fix-strokes` — multipart, stateless generation of a separate corrected SVG for analyzer-identified cut strokes. The response is a download; the uploaded original is unchanged, and the downloaded copy must be submitted to `/api/v1/analyze` again.
+- `POST /api/v1/fix-strokes` — multipart, stateless generation of a separate corrected SVG for analyzer-identified cut strokes. The uploaded original is unchanged.
+- `POST /api/v1/fix-artboard` — multipart, stateless generation of a separate SVG with the exact assignment artboard while preserving verified physical artwork geometry. The uploaded original is unchanged.
 
 The analysis API returns normalized, sanitized geometry and a versioned report. Valid embedded images are returned only as safely re-encoded preview data, while linked images are never fetched. Uploaded source markup is not echoed into the page.
 

@@ -3,7 +3,7 @@ import { findingEvidenceText, reportFileFacts } from './report'
 import type { AnalysisReport } from './types'
 
 const report: AnalysisReport = {
-  report_version: '1.0',
+  report_version: '1.2',
   analyzed_at: '2026-07-14T14:30:00Z',
   file: { name: 'student.svg', size_bytes: 512, sha256: 'a'.repeat(64) },
   profile: { id: 'classroom', name: 'Classroom', version: '1.0.0', demo: false },

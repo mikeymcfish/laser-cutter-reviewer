@@ -1,4 +1,4 @@
-import type { AnalysisReport, AnalyzeSelection, FixStrokeSelection, ProfileResponse } from './types'
+import type { AnalysisReport, AnalyzeSelection, FixAction, FixSelection, ProfileResponse } from './types'
 
 const errorMessage = async (response: Response): Promise<string> => {
   try {
@@ -58,11 +58,22 @@ export const analyzeSvg = async (
   return (await response.json()) as AnalysisReport
 }
 
-export const fixSvgStrokes = async (
+const fixEndpoint = (kind: unknown): string | null => {
+  if (kind === 'normalize_cut_strokes') return '/api/v1/fix-strokes'
+  if (kind === 'set_artboard') return '/api/v1/fix-artboard'
+  return null
+}
+
+export const fixSvg = async (
   file: File,
-  selection: FixStrokeSelection,
+  action: FixAction,
+  selection: FixSelection,
   signal?: AbortSignal,
 ): Promise<Blob> => {
+  // Dispatch from the known action kind. Never request a URL supplied in report JSON.
+  const endpoint = fixEndpoint(action.kind)
+  if (!endpoint) throw new ApiError('This correction action is not supported by this version of the reviewer.')
+
   const body = new FormData()
   body.append('file', file, file.name)
   body.append('assignment_id', selection.assignmentId)
@@ -70,7 +81,7 @@ export const fixSvgStrokes = async (
 
   let response: Response
   try {
-    response = await fetch('/api/v1/fix-strokes', {
+    response = await fetch(endpoint, {
       method: 'POST',
       body,
       signal,
@@ -81,7 +92,16 @@ export const fixSvgStrokes = async (
     throw new ApiError('The corrected SVG service could not be reached. Try again, or make the changes in Illustrator.')
   }
   if (!response.ok) throw new ApiError(await errorMessage(response), response.status)
-  return response.blob()
+  const corrected = await response.blob()
+  const contentType = response.headers?.get('content-type') ?? corrected.type
+  if (contentType && !contentType.toLowerCase().startsWith('image/svg+xml')) {
+    throw new ApiError('The correction service did not return an SVG. The original file and review were kept.', response.status)
+  }
+  const originalHash = response.headers?.get('x-original-sha256')?.toLowerCase()
+  if (originalHash && originalHash !== selection.expectedSha256.toLowerCase()) {
+    throw new ApiError('The correction response did not match the selected source file. The original file and review were kept.', response.status)
+  }
+  return corrected
 }
 
 export const sha256File = async (file: File): Promise<string> => {
