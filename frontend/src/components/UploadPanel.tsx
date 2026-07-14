@@ -1,6 +1,7 @@
 import { useId, useRef, useState, type ChangeEvent, type DragEvent } from 'react'
 import type { Assignment, Material } from '../types'
 import { displayName, materialThicknesses } from '../types'
+import { formatDimensionsInches } from '../units'
 import { FileIcon, UploadIcon } from './Icons'
 
 interface UploadPanelProps {
@@ -45,8 +46,12 @@ export function UploadPanel({
   const inputId = useId()
   const inputRef = useRef<HTMLInputElement>(null)
   const [dragging, setDragging] = useState(false)
+  const assignment = assignments.find((item) => item.id === assignmentId)
   const material = materials.find((item) => item.id === materialId)
   const thicknesses = materialThicknesses(material)
+  const exactArtboard = assignment?.page_policy === 'exact'
+    && assignment.expected_width_mm != null
+    && assignment.expected_height_mm != null
 
   const acceptFile = (candidate?: File) => {
     setDragging(false)
@@ -108,6 +113,15 @@ export function UploadPanel({
           </select>
         </label>
       </div>
+
+      {assignment?.description || exactArtboard ? (
+        <div className="assignment-note" aria-live="polite">
+          <div>
+            <strong>{exactArtboard ? `Required artboard: ${formatDimensionsInches(assignment.expected_width_mm, assignment.expected_height_mm)}` : 'Assignment note'}</strong>
+            {assignment.description ? <span>{assignment.description}</span> : null}
+          </div>
+        </div>
+      ) : null}
 
       <div
         className={`drop-zone${dragging ? ' is-dragging' : ''}${file ? ' has-file' : ''}`}

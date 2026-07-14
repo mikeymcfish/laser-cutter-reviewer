@@ -8,13 +8,14 @@ import io
 import pytest
 from fontTools.fontBuilder import FontBuilder
 from fontTools.pens.ttGlyphPen import TTGlyphPen
+from PIL import Image
 from pydantic import ValidationError
 
 from backend import main as main_module
 from backend.main import AggregateRequestLimitMiddleware
-from backend.models import LabProfile, ProcessProfile
+from backend.models import LabProfile, PreviewRasterLayer, ProcessProfile
 from backend.profile import load_profile, public_profile
-from backend.svg_analyzer import analyze_svg
+from backend.svg_analyzer import _safe_png_preview, analyze_svg
 
 from .conftest import check, post_svg, svg_document
 
@@ -136,13 +137,14 @@ def test_xml_depth_and_element_limits_fail_before_full_analysis():
 
 def test_duplicate_source_and_use_instance_ids_are_safe_and_unique(client):
     duplicate = svg_document(
-        '<g fill="none" stroke="#000" stroke-width=".096">'
+        '<g fill="none" stroke="#000" stroke-width=".2">'
         '<rect id="same" x="96" y="96" width="96" height="96"/>'
         '<rect id="same" x="240" y="96" width="96" height="96"/>'
         '</g>'
     )
     duplicate_report = post_svg(client, duplicate).json()
     assert check(duplicate_report, "document.unique_ids")["state"] == "blocker"
+    assert check(duplicate_report, "vectors.process_setup")["fix_actions"] == []
     ids = [item["id"] for item in duplicate_report["geometry"]["paths"]]
     assert len(ids) == len(set(ids))
 
@@ -192,6 +194,87 @@ def test_raster_placeholder_uses_normalized_transformed_bounds(client):
     assert "photo" in bounds_check["object_ids"]
 
 
+@pytest.mark.parametrize(
+    "limit_update",
+    [
+        {"max_embedded_images": 1},
+        {"max_total_embedded_image_pixels": 1},
+    ],
+)
+def test_cumulative_embedded_raster_work_limits_stop_additional_previews(limit_update):
+    profile = load_profile()
+    limited = profile.model_copy(update={"limits": profile.limits.model_copy(update=limit_update)})
+    png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    data = svg_document(
+        f'<image id="first-image" x="96" y="96" width="96" height="96" href="data:image/png;base64,{png}"/>'
+        f'<image id="over-limit-image" x="240" y="96" width="96" height="96" href="data:image/png;base64,{png}"/>'
+        '<rect id="cut" x="96" y="300" width="192" height="192" fill="none" stroke="#000" stroke-width=".096"/>'
+    )
+    report = analyze_svg(
+        data=data,
+        filename="raster-limits.svg",
+        profile=limited,
+        assignment=limited.assignments[0],
+        material=limited.materials[0],
+        thickness_mm=3,
+    ).model_dump(by_alias=True)
+    assert check(report, "assets.images_embedded")["state"] == "blocker"
+    assert report["metrics"]["image_count"] == 1
+    assert len(report["geometry"]["raster_assets"]) == 1
+    assert report["geometry"]["raster_assets"][0]["id"] == "raster-asset-0001"
+
+
+def test_zero_remaining_preview_budget_returns_without_pixel_conversion(monkeypatch):
+    profile = load_profile()
+    image = Image.new("RGB", (2, 3), "white")
+
+    def forbidden_convert(*_args, **_kwargs):
+        raise AssertionError("pixel conversion should not run without a preview-byte budget")
+
+    monkeypatch.setattr(Image.Image, "convert", forbidden_convert)
+    data_url, width, height = _safe_png_preview(image, profile.limits, remaining_bytes=0)
+    assert data_url is None
+    assert (width, height) == (2, 3)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["none", "xMinYMin meet", "xMidYMid meet", "xMaxYMax slice"],
+)
+def test_raster_layer_accepts_only_normalized_aspect_ratio_contract(value):
+    layer = PreviewRasterLayer(
+        id="layer",
+        asset_id="asset",
+        z_index=0,
+        corners_mm=[[0, 0], [1, 0], [1, 1], [0, 1]],
+        preserve_aspect_ratio=value,
+    )
+    assert layer.preserve_aspect_ratio == value
+
+
+@pytest.mark.parametrize("value", ["defer xMidYMid meet", "xmidymid meet", "stretch", "xMidYMid"])
+def test_raster_layer_rejects_non_normalized_aspect_ratio_values(value):
+    with pytest.raises(ValidationError):
+        PreviewRasterLayer(
+            id="layer",
+            asset_id="asset",
+            z_index=0,
+            corners_mm=[[0, 0], [1, 0], [1, 1], [0, 1]],
+            preserve_aspect_ratio=value,
+        )
+
+
+@pytest.mark.parametrize("z_index", [-1, "1"])
+def test_raster_layer_z_index_is_required_nonnegative_strict_integer(z_index):
+    with pytest.raises(ValidationError):
+        PreviewRasterLayer(
+            id="layer",
+            asset_id="asset",
+            z_index=z_index,
+            corners_mm=[[0, 0], [1, 0], [1, 1], [0, 1]],
+        )
+
+
 def test_unapproved_materials_are_not_public_and_metric_name_is_stable(client, good_svg):
     profile = load_profile()
     unapproved = profile.materials[0].model_copy(update={"id": "not-for-students", "approved": False})
@@ -212,6 +295,9 @@ def test_unapproved_materials_are_not_public_and_metric_name_is_stable(client, g
         lambda data: data["machine"].update(margin_mm=data["machine"]["bed_width_mm"]),
         lambda data: data["materials"][0]["preview"].update(color="wood"),
         lambda data: data.update(operator_checklist=[]),
+        lambda data: data["limits"].update(max_fixable_cut_stroke_width_mm=0),
+        lambda data: data["limits"].update(max_total_embedded_image_pixels=0),
+        lambda data: data["limits"].update(max_embedded_images=0),
     ],
 )
 def test_core_profile_validation_rejects_invalid_configuration(mutate):

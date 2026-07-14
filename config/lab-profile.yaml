@@ -1,7 +1,7 @@
 profile:
   id: epilog-classroom-demo
   name: Epilog Classroom Demo
-  version: 1.0.0
+  version: 1.1.0
   demo: true
 
 machine:
@@ -17,15 +17,22 @@ limits:
   max_path_segments: 20000
   max_xml_depth: 64
   max_preview_points: 30000
+  max_fixable_cut_stroke_width_mm: 0.254
+  max_embedded_image_pixels: 16777216
+  max_total_embedded_image_pixels: 33554432
+  max_embedded_images: 64
+  max_raster_preview_dimension_px: 2048
+  max_raster_preview_bytes: 2097152
+  max_total_raster_preview_bytes: 8388608
   analysis_timeout_seconds: 15
 
 assignments:
   - id: intro-svg
     name: Intro laser-cutting project
-    description: A 12 x 8 inch Illustrator artboard with black through-cut vectors.
+    description: A 12 x 12 inch Illustrator artboard with black through-cut vectors.
     page_policy: exact
     expected_width_mm: 304.8
-    expected_height_mm: 203.2
+    expected_height_mm: 304.8
     page_tolerance_mm: 0.25
     image_policy: warning
     min_raster_dpi: 300
@@ -39,10 +46,10 @@ assignments:
         require_closed: true
   - id: vector-trace
     name: Vector tracing exercise
-    description: Same cut setup, with raster images prohibited in the submitted artwork.
+    description: A 12 x 12 inch tracing artboard; raster images are prohibited in the submitted artwork.
     page_policy: exact
     expected_width_mm: 304.8
-    expected_height_mm: 203.2
+    expected_height_mm: 304.8
     page_tolerance_mm: 0.25
     image_policy: blocker
     min_raster_dpi: 300

@@ -1,12 +1,14 @@
 import { useMemo, useState } from 'react'
-import type { AnalysisCheck, CheckStatus } from '../types'
+import type { AnalysisCheck, CheckStatus, FixAction } from '../types'
 import { checkKey, checkStatus } from '../types'
-import { CheckIcon, EyeIcon, InfoIcon, WarningIcon, XIcon } from './Icons'
+import { CheckIcon, DownloadIcon, EyeIcon, InfoIcon, WarningIcon, XIcon } from './Icons'
 
 interface ChecklistProps {
   checks: AnalysisCheck[]
   selectedId: string | null
   onSelect: (check: AnalysisCheck) => void
+  onFixAction?: (action: FixAction) => void | Promise<void>
+  fixingActionId?: string | null
 }
 
 const labels: Record<CheckStatus | 'all', string> = {
@@ -34,7 +36,7 @@ const evidenceText = (evidence: AnalysisCheck['evidence']) => {
     .join(' · ')
 }
 
-export function Checklist({ checks, selectedId, onSelect }: ChecklistProps) {
+export function Checklist({ checks, selectedId, onSelect, onFixAction, fixingActionId }: ChecklistProps) {
   const [filter, setFilter] = useState<CheckStatus | 'all'>('all')
   const counts = useMemo(() => {
     const values = { blocker: 0, warning: 0, pass: 0, unverified: 0, info: 0 }
@@ -89,33 +91,66 @@ export function Checklist({ checks, selectedId, onSelect }: ChecklistProps) {
                 const selected = selectedId === checkKey(check)
                 const evidence = evidenceText(check.evidence)
                 return (
-                  <button
-                    type="button"
+                  <article
                     className={`check-card status-${status}${selected ? ' is-selected' : ''}`}
                     key={checkKey(check)}
-                    onClick={() => onSelect(check)}
-                    aria-expanded={selected}
                   >
-                    <span className="status-icon"><StatusIcon status={status} /></span>
-                    <span className="check-content">
-                      <span className="check-title-row">
-                        <strong>{check.title}</strong>
-                        <span className={`status-label ${status}`}>{labels[status]}</span>
-                      </span>
-                      <span className="check-summary">{check.summary ?? check.message ?? 'Review completed.'}</span>
-                      {selected ? (
-                        <span className="check-details">
-                          {evidence ? <span><b>Evidence</b>{evidence}</span> : null}
-                          {check.correction || check.fix || check.help ? (
-                            <span><b>How to fix it in Illustrator</b>{check.correction ?? check.fix ?? check.help}</span>
-                          ) : status === 'pass' ? (
-                            <span><b>Good to go</b>No changes are needed for this check.</span>
-                          ) : null}
+                    <button
+                      type="button"
+                      className="check-card-main"
+                      onClick={() => onSelect(check)}
+                      aria-expanded={selected}
+                    >
+                      <span className="status-icon"><StatusIcon status={status} /></span>
+                      <span className="check-content">
+                        <span className="check-title-row">
+                          <strong>{check.title}</strong>
+                          <span className={`status-label ${status}`}>{labels[status]}</span>
                         </span>
-                      ) : null}
-                    </span>
-                    <span className="inspect-icon" aria-hidden="true"><EyeIcon size={17} /></span>
-                  </button>
+                        <span className="check-summary">{check.summary ?? check.message ?? 'Review completed.'}</span>
+                        {selected ? (
+                          <span className="check-details">
+                            {evidence ? <span><b>Evidence</b>{evidence}</span> : null}
+                            {check.correction || check.fix || check.help ? (
+                              <span><b>How to fix it in Illustrator</b>{check.correction ?? check.fix ?? check.help}</span>
+                            ) : status === 'pass' ? (
+                              <span><b>Good to go</b>No changes are needed for this check.</span>
+                            ) : null}
+                          </span>
+                        ) : null}
+                      </span>
+                      <span className="inspect-icon" aria-hidden="true"><EyeIcon size={17} /></span>
+                    </button>
+                    {selected && onFixAction && check.fix_actions?.length ? (
+                      <div className="fix-actions" aria-label="Available corrections">
+                        {check.fix_actions.map((action) => {
+                          const fixing = fixingActionId === action.id
+                          const countLabel = `${action.count} ${action.count === 1 ? 'stroke' : 'strokes'}`
+                          return (
+                            <div className="fix-action" key={action.id}>
+                              <p>
+                                <strong>Creates through-cuts: #000000 at 0.001 in</strong>
+                                <span>{action.description}</span>
+                                <span>If any highlighted stroke is intentional engraving, cancel and correct it in Illustrator instead.</span>
+                                <span>Your original stays unchanged. Re-upload the corrected copy to verify it before submitting.</span>
+                              </p>
+                              <button
+                                type="button"
+                                className="fix-button"
+                                onClick={() => void onFixAction(action)}
+                                disabled={Boolean(fixingActionId)}
+                                aria-busy={fixing}
+                                aria-label={`${action.label}: change ${countLabel} to RGB black and 0.001 inches in a downloaded copy`}
+                              >
+                                {fixing ? <span className="button-spinner" aria-hidden="true" /> : <DownloadIcon size={16} />}
+                                {fixing ? 'Preparing corrected copy…' : action.label}
+                              </button>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    ) : null}
+                  </article>
                 )
               })}
             </div>

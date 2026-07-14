@@ -50,6 +50,13 @@ class LimitsProfile(StrictModel):
     max_path_segments: int = Field(gt=0)
     max_xml_depth: int = Field(gt=0)
     max_preview_points: int = Field(gt=0)
+    max_fixable_cut_stroke_width_mm: float = Field(gt=0)
+    max_embedded_image_pixels: int = Field(gt=0)
+    max_total_embedded_image_pixels: int = Field(gt=0)
+    max_embedded_images: int = Field(gt=0)
+    max_raster_preview_dimension_px: int = Field(gt=0)
+    max_raster_preview_bytes: int = Field(gt=0)
+    max_total_raster_preview_bytes: int = Field(gt=0)
     analysis_timeout_seconds: float = Field(gt=0)
 
 
@@ -175,6 +182,18 @@ class LabProfile(StrictModel):
 
 
 CheckState = Literal["pass", "blocker", "warning", "info", "unverified"]
+PreserveAspectRatio = Literal[
+    "none",
+    "xMinYMin meet", "xMinYMin slice",
+    "xMidYMin meet", "xMidYMin slice",
+    "xMaxYMin meet", "xMaxYMin slice",
+    "xMinYMid meet", "xMinYMid slice",
+    "xMidYMid meet", "xMidYMid slice",
+    "xMaxYMid meet", "xMaxYMid slice",
+    "xMinYMax meet", "xMinYMax slice",
+    "xMidYMax meet", "xMidYMax slice",
+    "xMaxYMax meet", "xMaxYMax slice",
+]
 
 
 class Bounds(StrictModel):
@@ -193,6 +212,19 @@ class CheckResult(StrictModel):
     fix: str | None = None
     object_ids: list[str] = Field(default_factory=list)
     bounds: list[Bounds] = Field(default_factory=list)
+    fix_actions: list["FixAction"] = Field(default_factory=list)
+
+
+class FixAction(StrictModel):
+    id: Literal["normalize-cut-strokes"]
+    kind: Literal["normalize_cut_strokes"] = "normalize_cut_strokes"
+    label: str
+    description: str
+    endpoint: Literal["/api/v1/fix-strokes"] = "/api/v1/fix-strokes"
+    object_ids: list[str] = Field(default_factory=list)
+    count: int = Field(gt=0)
+    target_color: Literal["#000000"] = "#000000"
+    target_stroke_width_in: Literal[0.001] = 0.001
 
 
 class FileInfo(StrictModel):
@@ -237,6 +269,7 @@ class DocumentInfo(StrictModel):
 
 class PreviewPath(StrictModel):
     id: str
+    z_index: int = Field(ge=0, strict=True)
     operation: str
     closed: bool
     stroke: str | None = None
@@ -253,16 +286,51 @@ class PreviewPiece(StrictModel):
     bounds: Bounds
 
 
+class PreviewRasterAsset(StrictModel):
+    id: str
+    data_url: str
+    pixel_width: int = Field(gt=0)
+    pixel_height: int = Field(gt=0)
+    preview_width_px: int = Field(gt=0)
+    preview_height_px: int = Field(gt=0)
+
+    @field_validator("data_url")
+    @classmethod
+    def require_sanitized_png(cls, value: str) -> str:
+        if not value.startswith("data:image/png;base64,"):
+            raise ValueError("raster preview assets must be server-generated PNG data URLs")
+        return value
+
+
+class PreviewRasterLayer(StrictModel):
+    id: str
+    asset_id: str
+    z_index: int = Field(ge=0, strict=True)
+    corners_mm: list[list[float]]
+    opacity: float = Field(default=1.0, ge=0, le=1)
+    blend_mode: Literal["multiply"] = "multiply"
+    preserve_aspect_ratio: PreserveAspectRatio = "xMidYMid meet"
+
+    @field_validator("corners_mm")
+    @classmethod
+    def require_four_corners(cls, value: list[list[float]]) -> list[list[float]]:
+        if len(value) != 4 or any(len(point) != 2 for point in value):
+            raise ValueError("raster layers need four transformed corners")
+        return value
+
+
 class PreviewGeometry(StrictModel):
     page: dict[str, float | None]
     paths: list[PreviewPath]
     pieces: list[PreviewPiece]
+    raster_assets: list[PreviewRasterAsset] = Field(default_factory=list)
+    raster_layers: list[PreviewRasterLayer] = Field(default_factory=list)
     valid_3d: bool
     invalid_reason: str | None = None
 
 
 class AnalysisReport(StrictModel):
-    report_version: str = "1.0"
+    report_version: str = "1.1"
     analyzed_at: str
     file: FileInfo
     profile: ProfileReference

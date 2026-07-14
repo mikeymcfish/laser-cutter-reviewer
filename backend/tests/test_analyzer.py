@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import io
 
 import pytest
+from PIL import Image
 
 from .conftest import check, post_svg, svg_document
 
@@ -58,17 +60,26 @@ def test_wrong_process_open_path_and_fill_are_reported(client):
     assert check(coincident_report, "geometry.closed_cuts")["state"] == "blocker"
 
 
-def test_thick_stroke_is_engraving_not_an_unapproved_cut(client):
+def test_cut_fix_width_cap_preserves_intentional_thick_black_engraving(client):
     data = svg_document(
         '<rect id="cut" x="96" y="96" width="192" height="192" fill="none" stroke="#000" stroke-width=".096"/>'
-        '<path id="engrave-line" d="M120 150H260" fill="none" stroke="#000" stroke-width="2"/>'
+        '<rect id="fixable-010" x="400" y="96" width="96" height="96" fill="none" stroke="#000" stroke-width="0.010in"/>'
+        '<path id="engrave-2px" d="M120 350H260" fill="none" stroke="#000" stroke-width="2px"/>'
+        '<path id="engrave-2pt" d="M120 390H260" fill="none" stroke="#000" stroke-width="2pt"/>'
+        '<path id="filled-engrave" d="M120 430H260" fill="#cccccc" stroke="#000" stroke-width=".2"/>'
     )
     report = post_svg(client, data).json()
-    assert check(report, "vectors.process_setup")["state"] == "pass"
+    process = check(report, "vectors.process_setup")
+    assert process["state"] == "blocker"
+    assert "fixable-010" in process["object_ids"]
+    assert process["fix_actions"][0]["kind"] == "normalize_cut_strokes"
+    assert process["fix_actions"][0]["object_ids"] == ["fixable-010"]
     assert check(report, "vectors.unapproved_hairlines")["state"] == "pass"
-    engrave = next(item for item in report["geometry"]["paths"] if item["id"] == "engrave-line")
-    assert engrave["operation"] == "engrave"
-    assert report["metrics"]["operation_inventory"]["engrave"] == 1
+    operations = {item["id"]: item["operation"] for item in report["geometry"]["paths"]}
+    assert operations["engrave-2px"] == "engrave"
+    assert operations["engrave-2pt"] == "engrave"
+    assert operations["filled-engrave"] == "engrave"
+    assert report["metrics"]["operation_inventory"]["engrave"] == 3
 
 
 def test_illustrator_css_and_nested_uniform_transform_are_resolved(client):
@@ -142,16 +153,75 @@ def test_embedded_raster_is_flagged_by_assignment_policy(client):
         base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
     ).decode()
     body = (
-        f'<image id="reference" x="96" y="96" width="96" height="96" href="data:image/png;base64,{png}"/>'
+        f'<image id="reference" x="96" y="96" width="96" height="96" '
+        f'preserveAspectRatio="xMaxYMin slice" href="data:image/png;base64,{png}"/>'
         '<rect id="part" x="96" y="96" width="192" height="192" fill="none" stroke="#000" stroke-width=".096"/>'
     )
     warning = post_svg(client, svg_document(body), assignment="intro-svg").json()
     assert check(warning, "assets.images_embedded")["state"] == "pass"
     assert check(warning, "assets.raster_presence")["state"] == "warning"
     assert check(warning, "assets.raster_resolution")["state"] == "warning"
+    assets = warning["geometry"]["raster_assets"]
+    layers = warning["geometry"]["raster_layers"]
+    assert len(assets) == 1
+    assert len(layers) == 1
+    assert layers[0]["asset_id"] == assets[0]["id"]
+    assert layers[0]["blend_mode"] == "multiply"
+    assert layers[0]["z_index"] == 0
+    assert layers[0]["preserve_aspect_ratio"] == "xMaxYMin slice"
+    assert len(layers[0]["corners_mm"]) == 4
+    assert assets[0]["data_url"].startswith("data:image/png;base64,")
+    assert assets[0]["data_url"] != f"data:image/png;base64,{png}"
+    assert assets[0]["preview_width_px"] <= 2048
+    assert assets[0]["preview_height_px"] <= 2048
+    sanitized_bytes = base64.b64decode(assets[0]["data_url"].split(",", 1)[1])
+    with Image.open(io.BytesIO(sanitized_bytes)) as preview:
+        assert preview.format == "PNG"
+        preview.verify()
+    cut_path = next(item for item in warning["geometry"]["paths"] if item["id"] == "part")
+    assert cut_path["z_index"] == 1
 
     blocked = post_svg(client, svg_document(body), assignment="vector-trace").json()
     assert check(blocked, "assets.raster_presence")["state"] == "blocker"
+
+
+def test_supported_png_and_jpeg_mime_types_match_decoded_pixels(client):
+    png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    jpeg_bytes = io.BytesIO()
+    Image.new("RGB", (2, 2), "white").save(jpeg_bytes, format="JPEG")
+    jpeg = base64.b64encode(jpeg_bytes.getvalue()).decode("ascii")
+    data = svg_document(
+        f'<image id="png" x="96" y="96" width="96" height="96" href="data:image/png;base64,{png}"/>'
+        f'<image id="jpeg" x="240" y="96" width="96" height="96" href="data:image/jpeg;base64,{jpeg}"/>'
+        '<rect id="cut" x="96" y="300" width="192" height="192" fill="none" stroke="#000" stroke-width=".096"/>'
+    )
+    report = post_svg(client, data).json()
+    assert check(report, "assets.images_embedded")["state"] == "pass"
+    assert report["metrics"]["image_count"] == 2
+    assert len(report["geometry"]["raster_assets"]) == 2
+
+
+def test_embedded_raster_mime_mismatches_are_blocked(client):
+    png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    jpeg_bytes = io.BytesIO()
+    Image.new("RGB", (2, 2), "white").save(jpeg_bytes, format="JPEG")
+    jpeg = base64.b64encode(jpeg_bytes.getvalue()).decode("ascii")
+    cases = [
+        ("image/svg+xml", png),
+        ("text/plain", png),
+        ("image/jpeg", png),
+        ("image/png", jpeg),
+    ]
+    for index, (declared_type, payload) in enumerate(cases):
+        data = svg_document(
+            f'<image id="mismatch-{index}" x="96" y="96" width="96" height="96" '
+            f'href="data:{declared_type};base64,{payload}"/>'
+            '<rect id="wrong-cut" x="300" y="96" width="96" height="96" fill="none" stroke="#ff0000" stroke-width=".096"/>'
+        )
+        report = post_svg(client, data).json()
+        assert check(report, "assets.images_embedded")["state"] == "blocker"
+        assert check(report, "vectors.process_setup")["fix_actions"] == []
+        assert report["geometry"]["raster_assets"] == []
 
 
 def test_tiny_piece_triggers_material_fragility_warning(client):

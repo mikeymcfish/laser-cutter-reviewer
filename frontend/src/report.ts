@@ -1,6 +1,7 @@
 import { jsPDF } from 'jspdf'
-import type { AnalysisCheck, AnalysisReport, CheckStatus } from './types'
+import type { AnalysisCheck, AnalysisReport, CheckStatus, PreviewPath, PreviewRasterLayer } from './types'
 import { checkStatus } from './types'
+import { formatCutDensityInches, formatDimensionsInches, formatInches } from './units'
 
 interface ManualCheck {
   label: string
@@ -22,7 +23,57 @@ const pathColor = (operation?: string) => {
   return '#171a1f'
 }
 
-const previewDataUrl = (report: AnalysisReport): string | null => {
+const canonicalPng = (value: string) => (
+  /^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/.test(value)
+  && value.length <= 8 * 1024 * 1024
+)
+
+const loadPng = (source: string) => new Promise<HTMLImageElement>((resolve, reject) => {
+  const image = new Image()
+  image.onload = () => resolve(image)
+  image.onerror = () => reject(new Error('The sanitized raster preview could not be decoded.'))
+  image.src = source
+})
+
+const canonicalPreserveAspectRatio = (value: string) => (
+  /^(?:none|x(?:Min|Mid|Max)Y(?:Min|Mid|Max) (?:meet|slice))$/.test(value)
+    ? value
+    : 'xMidYMid meet'
+)
+
+const rasterPlacement = (image: HTMLImageElement, preserve: string) => {
+  const canonical = canonicalPreserveAspectRatio(preserve)
+  if (canonical === 'none') return { x: 0, y: 0, width: 1, height: 1 }
+  const [alignment, scaling = 'meet'] = canonical.split(' ')
+  const pixelWidth = image.naturalWidth || image.width || 1
+  const pixelHeight = image.naturalHeight || image.height || 1
+  const aspect = pixelWidth / pixelHeight
+  let width = 1
+  let height = 1
+  if (scaling === 'slice') {
+    if (aspect >= 1) width = aspect
+    else height = 1 / aspect
+  } else if (aspect >= 1) {
+    height = 1 / aspect
+  } else {
+    width = aspect
+  }
+  const x = alignment.startsWith('xMin') ? 0 : alignment.startsWith('xMax') ? 1 - width : (1 - width) / 2
+  const y = alignment.includes('YMin') ? 0 : alignment.includes('YMax') ? 1 - height : (1 - height) / 2
+  return { x, y, width, height }
+}
+
+interface PreparedRaster {
+  layer: PreviewRasterLayer
+  image: HTMLImageElement
+  sequence: number
+}
+
+type CanvasPreviewLayer =
+  | { kind: 'path'; path: PreviewPath; zIndex: number; sequence: number }
+  | { kind: 'raster'; raster: PreparedRaster; zIndex: number; sequence: number }
+
+const previewDataUrl = async (report: AnalysisReport): Promise<string | null> => {
   const canvas = document.createElement('canvas')
   canvas.width = 1000
   canvas.height = 620
@@ -42,16 +93,79 @@ const previewDataUrl = (report: AnalysisReport): string | null => {
   context.shadowColor = 'transparent'
   context.lineCap = 'round'
   context.lineJoin = 'round'
-  report.geometry.paths.forEach((path) => {
-    if (path.points.length < 2) return
-    context.beginPath()
-    context.moveTo(left + path.points[0][0] * scale, top + path.points[0][1] * scale)
-    path.points.slice(1).forEach(([x, y]) => context.lineTo(left + x * scale, top + y * scale))
-    if (path.closed) context.closePath()
-    context.strokeStyle = pathColor(path.operation)
-    context.lineWidth = Math.max(1.4, scale * 0.12)
-    context.stroke()
-  })
+  const assets = new Map(
+    (report.geometry.raster_assets ?? [])
+      .filter((asset) => canonicalPng(asset.data_url))
+      .map((asset) => [asset.id, asset]),
+  )
+  const preparedRasters: PreparedRaster[] = []
+  for (const [index, layer] of (report.geometry.raster_layers ?? []).entries()) {
+    const asset = assets.get(layer.asset_id)
+    const corners = layer.corners_mm
+    if (!asset || layer.blend_mode !== 'multiply' || corners.length < 4) continue
+    const [topLeft, topRight, , bottomLeft] = corners
+    if (![topLeft, topRight, bottomLeft].every((point) => point.every(Number.isFinite))) continue
+    try {
+      const image = await loadPng(asset.data_url)
+      preparedRasters.push({ layer, image, sequence: report.geometry.paths.length + index })
+    } catch {
+      // The report remains useful if an optional sanitized thumbnail cannot decode.
+    }
+  }
+  const rasterLayerIds = new Set(preparedRasters.map(({ layer }) => layer.id))
+  const previewLayers: CanvasPreviewLayer[] = [
+    ...report.geometry.paths
+      .filter((path) => !(path.operation?.includes('raster') && rasterLayerIds.has(path.id)))
+      .map((path, index) => ({
+        kind: 'path' as const,
+        path,
+        zIndex: Number.isFinite(path.z_index) ? path.z_index : index,
+        sequence: index,
+      })),
+    ...preparedRasters.map((raster) => ({
+      kind: 'raster' as const,
+      raster,
+      zIndex: Number.isFinite(raster.layer.z_index) ? raster.layer.z_index : raster.sequence,
+      sequence: raster.sequence,
+    })),
+  ].sort((leftLayer, rightLayer) => leftLayer.zIndex - rightLayer.zIndex || leftLayer.sequence - rightLayer.sequence)
+
+  for (const previewLayer of previewLayers) {
+    if (previewLayer.kind === 'path') {
+      const { path } = previewLayer
+      if (path.points.length < 2) continue
+      context.beginPath()
+      context.moveTo(left + path.points[0][0] * scale, top + path.points[0][1] * scale)
+      path.points.slice(1).forEach(([x, y]) => context.lineTo(left + x * scale, top + y * scale))
+      if (path.closed) context.closePath()
+      context.strokeStyle = pathColor(path.operation)
+      context.lineWidth = Math.max(1.4, scale * 0.12)
+      context.stroke()
+      continue
+    }
+    const { layer, image } = previewLayer.raster
+    const [topLeft, topRight, , bottomLeft] = layer.corners_mm
+    const placement = rasterPlacement(image, layer.preserve_aspect_ratio)
+    context.save()
+    try {
+      context.globalCompositeOperation = 'multiply'
+      context.globalAlpha = Number.isFinite(layer.opacity) ? Math.min(1, Math.max(0, layer.opacity)) : 1
+      context.setTransform(
+        (topRight[0] - topLeft[0]) * scale,
+        (topRight[1] - topLeft[1]) * scale,
+        (bottomLeft[0] - topLeft[0]) * scale,
+        (bottomLeft[1] - topLeft[1]) * scale,
+        left + topLeft[0] * scale,
+        top + topLeft[1] * scale,
+      )
+      context.beginPath()
+      context.rect(0, 0, 1, 1)
+      context.clip()
+      context.drawImage(image, placement.x, placement.y, placement.width, placement.height)
+    } finally {
+      context.restore()
+    }
+  }
   return canvas.toDataURL('image/png')
 }
 
@@ -77,7 +191,7 @@ export const reportFileFacts = (report: AnalysisReport): Array<{ label: string; 
   const width = report.document.width_mm ?? report.geometry.page.width_mm
   const height = report.document.height_mm ?? report.geometry.page.height_mm
   const dimensions = width != null && height != null
-    ? `${reportNumber(width)} × ${reportNumber(height)} mm`
+    ? formatDimensionsInches(width, height, 2, 'Physical size unresolved')
     : 'Physical size unresolved'
   const smallestFeature = report.metrics.minimum_feature_mm ?? report.metrics.smallest_estimated_feature_mm
   const operations = report.metrics.operation_inventory
@@ -92,24 +206,24 @@ export const reportFileFacts = (report: AnalysisReport): Array<{ label: string; 
   const fontSummary = `${reportNumber(report.metrics.live_text_count ?? 0)} live / ${reportNumber(report.metrics.embedded_font_count ?? 0)} embedded${embeddedFamilies ? ` (${embeddedFamilies})` : ''}`
   return [
     { label: 'Document', value: dimensions },
-    { label: 'Units', value: `${report.document.units || 'Unknown'} (${report.document.unit_confidence || 'unverified'})` },
+    { label: 'Display units', value: `Inches (source: ${report.document.units || 'unknown'}, ${report.document.unit_confidence || 'unverified'} scale)` },
     { label: 'Objects', value: reportNumber(report.metrics.object_count) },
     { label: 'Vector paths', value: reportNumber(report.metrics.vector_path_count ?? report.geometry.paths.length) },
     { label: 'Operations', value: operationSummary },
-    { label: 'Cut length', value: reportNumber(report.metrics.total_cut_length_mm, ' mm') },
+    { label: 'Cut length', value: formatInches(report.metrics.total_cut_length_mm, 2, 'Not reported') },
     { label: 'Raster images', value: reportNumber(report.metrics.image_count ?? 0) },
     { label: 'Raster DPI', value: reportNumber(report.metrics.minimum_raster_dpi, ' DPI') },
     { label: 'Raster DPI guideline', value: reportNumber(report.metrics.required_raster_dpi, ' DPI') },
     { label: 'Fonts', value: fontSummary },
-    { label: 'Smallest feature', value: reportNumber(smallestFeature, ' mm') },
-    { label: 'Minimum cut spacing', value: reportNumber(report.metrics.minimum_cut_spacing_mm, ' mm') },
-    { label: 'Cut density', value: reportNumber(report.metrics.cut_density_mm_per_mm2, ' mm/mm²') },
-    { label: 'Heat-density guideline', value: reportNumber(report.metrics.heat_density_threshold_mm_per_mm2, ' mm/mm²') },
-    { label: 'Kerf estimate', value: reportNumber(report.selection.kerf_mm ?? report.metrics.kerf_mm, ' mm') },
+    { label: 'Smallest feature', value: formatInches(smallestFeature, 3, 'Not reported') },
+    { label: 'Minimum cut spacing', value: formatInches(report.metrics.minimum_cut_spacing_mm, 3, 'Not reported') },
+    { label: 'Cut density', value: formatCutDensityInches(report.metrics.cut_density_mm_per_mm2, 3, 'Not reported') },
+    { label: 'Heat-density guideline', value: formatCutDensityInches(report.metrics.heat_density_threshold_mm_per_mm2, 3, 'Not reported') },
+    { label: 'Kerf estimate', value: formatInches(report.selection.kerf_mm ?? report.metrics.kerf_mm, 3, 'Not reported') },
   ]
 }
 
-export const downloadReport = (
+export const downloadReport = async (
   report: AnalysisReport,
   fingerprint: string,
   manualChecks: ManualCheck[],
@@ -160,7 +274,7 @@ export const downloadReport = (
     { size: 8, color: '#596273' },
   )
   wrapped(
-    `${report.selection.assignment_label ?? report.selection.assignment_id ?? 'Assignment'} · ${report.selection.material_label ?? report.selection.material_id ?? 'Material'} · ${report.selection.thickness_mm ?? '—'} mm`,
+    `${report.selection.assignment_label ?? report.selection.assignment_id ?? 'Assignment'} · ${report.selection.material_label ?? report.selection.material_id ?? 'Material'} · ${formatInches(report.selection.thickness_mm)}`,
     margin,
     contentWidth,
     { size: 9 },
@@ -174,7 +288,7 @@ export const downloadReport = (
     { size: 8, color: '#45516a' },
   )
 
-  const preview = previewDataUrl(report)
+  const preview = await previewDataUrl(report)
   if (preview) {
     ensureSpace(69)
     pdf.addImage(preview, 'PNG', margin, y, contentWidth, 63, undefined, 'FAST')

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import pytest
+
+from backend import svg_analyzer as analyzer_module
+
 from .conftest import check, expected_hash, post_svg
+from .conftest import svg_document
 
 
 def test_health_and_profile(client):
@@ -23,11 +28,11 @@ def test_known_good_svg_returns_normalized_report(client, good_svg):
     response = post_svg(client, good_svg)
     assert response.status_code == 200, response.text
     report = response.json()
-    assert report["report_version"] == "1.0"
+    assert report["report_version"] == "1.1"
     assert report["file"]["sha256"] == expected_hash(good_svg)
     assert report["file"]["name"] == "student.svg"
     assert report["document"]["width_mm"] == 304.8
-    assert report["document"]["height_mm"] == 203.2
+    assert report["document"]["height_mm"] == 304.8
     assert check(report, "document.page_size")["state"] == "pass"
     assert check(report, "vectors.process_setup")["state"] == "pass"
     assert check(report, "geometry.closed_cuts")["state"] == "pass"
@@ -56,6 +61,112 @@ def test_selection_and_upload_validation(client, good_svg):
     assert bad_extension.status_code == 415
 
 
+def test_fix_strokes_returns_verified_copy_and_preserves_original(client):
+    data = svg_document(
+        '<style>.wrong-size{fill:none;stroke:#000000;stroke-width:.48}</style>'
+        '<g transform="translate(40 20) scale(2)">'
+        '<rect id="wrong-size" class="wrong-size" x="48" y="48" width="96" height="96"/>'
+        '</g>'
+        '<rect id="wrong-color" x="500" y="96" width="192" height="192" '
+        'fill="none" stroke="#ff0000" stroke-width=".096"/>'
+        '<path id="intentional-thick" d="M500 350H700" fill="none" stroke="#000" stroke-width="2px"/>'
+    )
+    original = bytes(data)
+    analyzed = post_svg(client, data).json()
+    process = check(analyzed, "vectors.process_setup")
+    assert process["state"] == "blocker"
+    action = process["fix_actions"][0]
+    assert action["id"] == "normalize-cut-strokes"
+    assert action["count"] == 2
+    assert set(action["object_ids"]) == {"wrong-size", "wrong-color"}
+
+    response = client.post(
+        "/api/v1/fix-strokes",
+        files={"file": ("student.svg", data, "image/svg+xml")},
+        data={"assignment_id": "intro-svg", "expected_sha256": expected_hash(data)},
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("image/svg+xml")
+    assert response.headers["x-original-sha256"] == expected_hash(data)
+    assert response.headers["x-corrected-stroke-count"] == "2"
+    assert "student-cut-strokes-fixed.svg" in response.headers["content-disposition"]
+    assert data == original
+    assert response.content != data
+    assert b"0.001in" in response.content
+    assert b"non-scaling-stroke" in response.content
+
+    reanalyzed = post_svg(client, response.content, name="student-fixed.svg").json()
+    assert check(reanalyzed, "vectors.process_setup")["state"] == "pass"
+    for object_id in ("wrong-size", "wrong-color"):
+        path = next(item for item in reanalyzed["geometry"]["paths"] if item["id"] == object_id)
+        assert path["stroke"] == "#000000"
+        assert path["stroke_width_mm"] == 0.0254
+    thick = next(item for item in reanalyzed["geometry"]["paths"] if item["id"] == "intentional-thick")
+    assert thick["operation"] == "engrave"
+    assert thick["stroke_width_mm"] == 0.52917
+
+
+def test_fix_strokes_rejects_a_stale_fingerprint(client, good_svg):
+    response = client.post(
+        "/api/v1/fix-strokes",
+        files={"file": ("student.svg", good_svg, "image/svg+xml")},
+        data={"assignment_id": "intro-svg", "expected_sha256": "0" * 64},
+    )
+    assert response.status_code == 409
+    assert "analyze" in response.json()["detail"].lower()
+
+
+def test_important_css_is_reported_and_never_auto_fixed(client):
+    data = svg_document(
+        '<style>.bad{fill:none;stroke:#ff0000 !/**/ important;stroke-width:.096}</style>'
+        '<rect id="important-cut" class="bad" x="96" y="96" width="192" height="192"/>'
+    )
+    report = post_svg(client, data).json()
+    assert check(report, "geometry.effects")["state"] == "blocker"
+    assert any("important" in item.lower() for item in check(report, "geometry.effects")["evidence"])
+    assert check(report, "vectors.process_setup")["fix_actions"] == []
+
+    fixed = client.post(
+        "/api/v1/fix-strokes",
+        files={"file": ("important.svg", data, "image/svg+xml")},
+        data={"assignment_id": "intro-svg", "expected_sha256": expected_hash(data)},
+    )
+    assert fixed.status_code == 422
+    assert "css" in fixed.json()["detail"].lower()
+
+
+def test_shared_use_target_is_never_auto_fixed_across_different_instances(client):
+    data = svg_document(
+        '<rect id="shared" x="96" y="96" width="96" height="96" fill="none" stroke="#ff0000" stroke-width=".096"/>'
+        '<use id="wrong-use" href="#shared" x="150" y="150"/>'
+        '<use id="engrave-use" href="#shared" x="300" y="96" fill="#cccccc" stroke="#000000" stroke-width="2px"/>'
+    )
+    report = post_svg(client, data).json()
+    process = check(report, "vectors.process_setup")
+    assert process["state"] == "blocker"
+    assert any(item in process["object_ids"] for item in ("shared", "wrong-use"))
+    assert process["fix_actions"] == []
+
+    fixed = client.post(
+        "/api/v1/fix-strokes",
+        files={"file": ("uses.svg", data, "image/svg+xml")},
+        data={"assignment_id": "intro-svg", "expected_sha256": expected_hash(data)},
+    )
+    assert fixed.status_code == 422
+    assert "use" in fixed.json()["detail"].lower()
+
+
+def test_default_assignment_requires_twelve_inch_square(client, good_svg):
+    accepted = post_svg(client, good_svg).json()
+    assert check(accepted, "document.page_size")["state"] == "pass"
+
+    old_page = good_svg.replace(b'height="12in"', b'height="8in"').replace(
+        b'viewBox="0 0 1152 1152"', b'viewBox="0 0 1152 768"'
+    )
+    rejected = post_svg(client, old_page).json()
+    assert check(rejected, "document.page_size")["state"] == "blocker"
+
+
 def test_malformed_and_active_svg_are_structured_blockers(client):
     malformed = post_svg(client, b"<svg><path></svg>")
     assert malformed.status_code == 200
@@ -76,13 +187,25 @@ def test_malformed_and_active_svg_are_structured_blockers(client):
     assert check(animated.json(), "file.security")["state"] == "blocker"
 
 
-def test_external_resource_and_doctype_never_reach_parser(client):
+def test_linked_image_gets_specific_embedding_blocker_and_doctype_is_rejected(client, monkeypatch):
+    def forbidden_fetch(*_args, **_kwargs):
+        raise AssertionError("linked image fetch was attempted")
+
+    monkeypatch.setattr("urllib.request.urlopen", forbidden_fetch)
     external = post_svg(
         client,
-        b'<svg xmlns="http://www.w3.org/2000/svg" width="12in" height="8in"><image href="https://example.test/a.png"/></svg>',
+        b'<svg xmlns="http://www.w3.org/2000/svg" width="12in" height="12in" viewBox="0 0 1152 1152">'
+        b'<image id="linked-photo" x="96" y="96" width="96" height="96" href="https://example.test/a.png"/>'
+        b'<rect id="wrong-cut" x="300" y="96" width="96" height="96" fill="none" stroke="#ff0000" stroke-width=".096"/>'
+        b'</svg>',
     )
     assert external.status_code == 200
-    assert check(external.json(), "file.security")["state"] == "blocker"
+    finding = check(external.json(), "assets.images_embedded")
+    assert finding["state"] == "blocker"
+    assert "pointer" in finding["message"].lower()
+    assert "example.test" not in external.text
+    assert external.json()["geometry"]["raster_assets"] == []
+    assert check(external.json(), "vectors.process_setup")["fix_actions"] == []
 
     entity = post_svg(
         client,
@@ -90,3 +213,85 @@ def test_external_resource_and_doctype_never_reach_parser(client):
     )
     assert entity.status_code == 200
     assert check(entity.json(), "file.security")["state"] == "blocker"
+
+
+@pytest.mark.parametrize(
+    "extra_reference",
+    [
+        'src="https://private.example/reference.png"',
+        'xmlns:xlink="http://www.w3.org/1999/xlink" xlink:href="file:///student/reference.png"',
+    ],
+)
+def test_any_external_image_attribute_blocks_even_with_an_embedded_href(client, extra_reference):
+    png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    data = svg_document(
+        f'<image id="mixed-reference" x="96" y="96" width="96" height="96" '
+        f'href="data:image/png;base64,{png}" {extra_reference}/>'
+        '<rect id="wrong-cut" x="300" y="96" width="96" height="96" fill="none" stroke="#ff0000" stroke-width=".096"/>'
+    )
+    response = post_svg(client, data)
+    report = response.json()
+    assert check(report, "assets.images_embedded")["state"] == "blocker"
+    assert check(report, "vectors.process_setup")["fix_actions"] == []
+    assert report["geometry"]["raster_assets"] == []
+    assert "private.example" not in response.text
+    assert "file:///" not in response.text
+
+
+def test_identical_embedded_href_and_xlink_href_are_accepted(client):
+    png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    uri = f"data:image/png;base64,{png}"
+    data = svg_document(
+        f'<image id="dual-reference" xmlns:xlink="http://www.w3.org/1999/xlink" '
+        f'x="96" y="96" width="96" height="96" href="{uri}" xlink:href="{uri}"/>'
+        '<rect id="cut" x="300" y="96" width="96" height="96" fill="none" stroke="#000" stroke-width=".096"/>'
+    )
+    report = post_svg(client, data).json()
+    assert check(report, "assets.images_embedded")["state"] == "pass"
+    assert len(report["geometry"]["raster_assets"]) == 1
+
+
+def test_conflicting_embedded_image_references_block_preview_and_fix(client):
+    png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    data = svg_document(
+        f'<image id="conflicting-reference" xmlns:xlink="http://www.w3.org/1999/xlink" '
+        f'x="96" y="96" width="96" height="96" href="data:image/png;base64,{png}" '
+        'xlink:href="data:image/svg+xml;base64,PHN2Zy8+"/>'
+        '<rect id="wrong-cut" x="300" y="96" width="96" height="96" fill="none" stroke="#ff0000" stroke-width=".096"/>'
+    )
+    report = post_svg(client, data).json()
+    assert check(report, "assets.images_embedded")["state"] == "blocker"
+    assert check(report, "vectors.process_setup")["fix_actions"] == []
+    assert report["geometry"]["raster_assets"] == []
+
+    fixed = client.post(
+        "/api/v1/fix-strokes",
+        files={"file": ("conflict.svg", data, "image/svg+xml")},
+        data={"assignment_id": "intro-svg", "expected_sha256": expected_hash(data)},
+    )
+    assert fixed.status_code == 422
+
+
+def test_fixer_neutralizes_embedded_payloads_during_both_geometry_passes(client, monkeypatch):
+    png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    data = svg_document(
+        f'<image id="embedded" x="96" y="96" width="96" height="96" href="data:image/png;base64,{png}"/>'
+        '<rect id="wrong-cut" x="300" y="96" width="96" height="96" fill="none" stroke="#ff0000" stroke-width=".096"/>'
+    )
+    original_extract = analyzer_module._extract_paths
+    inspected_xml: list[str] = []
+
+    def guarded_extract(xml_text, *args, **kwargs):
+        inspected_xml.append(xml_text)
+        assert png not in xml_text
+        return original_extract(xml_text, *args, **kwargs)
+
+    monkeypatch.setattr(analyzer_module, "_extract_paths", guarded_extract)
+    response = client.post(
+        "/api/v1/fix-strokes",
+        files={"file": ("embedded.svg", data, "image/svg+xml")},
+        data={"assignment_id": "intro-svg", "expected_sha256": expected_hash(data)},
+    )
+    assert response.status_code == 200, response.text
+    assert len(inspected_xml) == 2
+    assert png.encode() in response.content

@@ -11,24 +11,28 @@ short_description: Student SVG preflight for Epilog laser cutter projects
 
 # Laser Cutter Reviewer
 
-Laser Cutter Reviewer is a student-facing preflight tool for Adobe Illustrator SVG exports. It checks document setup, vector cut geometry, embedded resources, and material-dependent risk indicators before a file reaches the instructor. Results include an annotated 2D view, an approximate material preview, and a fingerprinted PDF report.
+Laser Cutter Reviewer is a student-facing preflight tool for Adobe Illustrator SVG exports. It checks document setup, vector cut geometry, embedded resources, and material-dependent risk indicators before a file reaches the instructor. The classroom assignments default to a 12 x 12 inch artboard, and physical measurements are presented in inches while the analyzer continues to normalize geometry internally in millimeters. Results include an annotated 2D view, an approximate material preview, and a fingerprinted PDF report.
 
-The app does **not** modify uploaded files, set laser power/speed, or certify that a job is safe to run. “Ready for teacher review” only means that the automated profile checks found no blockers. An instructor must still inspect the file, material, machine settings, ventilation, focus, placement, and supervision requirements.
+The app never changes the uploaded original, sets laser power/speed, or certifies that a job is safe to run. When the analyzer identifies eligible cut strokes with the wrong color or width, a student may explicitly download a separate corrected SVG that normalizes only those identified strokes to `#000000` and `0.001in`. The corrected copy must be uploaded and reviewed again; it is not automatically accepted or substituted for the original. “Ready for teacher review” only means that the automated profile checks found no blockers. An instructor must still inspect the file, material, machine settings, ventilation, focus, placement, and supervision requirements.
 
 ## Privacy and security
 
 - Analysis is anonymous and stateless; there are no accounts or submission records.
 - Uploaded SVG data is processed in memory or short-lived request storage and is not retained by the application.
 - The browser renders normalized preview geometry returned by the analyzer, never the uploaded SVG markup itself.
+- Valid embedded PNG and JPEG images are decoded, format-checked, bounded, and safely re-encoded before they are returned as multiply-blended preview layers.
+- Linked images are blockers because the SVG contains only a reference to pixels that are not present in the upload. External resources are never fetched; students must embed linked images in Illustrator before exporting again.
 - External SVG resources, scripts, entities, and unsafe document features are rejected or reported.
 - The default maximum upload size is 20 MB, with additional geometry and analysis limits in the service.
 
 Deploying a public Space sends files to Hugging Face infrastructure for transient processing. Confirm that this is compatible with school policy before inviting students to use it.
 
-## Version 1 scope
+## Version 1.1 scope
 
 - SVG is the only accepted file format, with Adobe Illustrator exports as the primary target.
-- The app reviews and visualizes a file but never rewrites it.
+- Classroom assignments use a 12 x 12 inch default artboard, and student-facing measurements default to inches.
+- The uploaded original is read-only. Stroke correction is an explicit, confirmed download of a separate SVG containing only analyzer-identified likely cut-stroke normalization to pure RGB black (`#000000`) and `0.001in`; the student must re-upload that copy for a complete review. Automatic correction is limited to plausible cut widths up to `0.010in` and is disabled for documents with shared `<use>` geometry, CSS priorities, ambiguous transforms, unsafe effects, or unresolved resources so intentional engraving is not silently converted.
+- Embedded raster images can appear in the sanitized 2D preview as multiply-blended layers. Linked images remain blocked because their pixel data is absent from the SVG.
 - Packing/nesting is intentionally deferred. A future packer must preserve the original and export a separate packed SVG.
 - The 3D view is an approximate inspection aid; it cannot infer keep-versus-scrap, assembly intent, charring, or real strength.
 - PDF and DXF can be added later as parser adapters behind the same normalized report format.
@@ -38,7 +42,7 @@ Deploying a public Space sends files to Hugging Face infrastructure for transien
 Rules live in `config/lab-profile.yaml`. The checked-in profile is intentionally marked `demo: true`; it provides realistic examples but cannot return a production “Ready for teacher review” result. Before classroom use:
 
 1. Enter the exact usable bed dimensions and margins for the lab's Epilog machine.
-2. Confirm assignment page dimensions, process colors, and accepted stroke widths.
+2. Confirm the 12 x 12 inch classroom assignment default, process colors, and accepted stroke widths against the lab workflow.
 3. Replace example materials with approved products and verified thickness, kerf, bridge, spacing, and loose-piece thresholds.
 4. Set `demo: false` only after testing at least one known-good and one known-bad Illustrator export against the physical lab workflow.
 
@@ -106,8 +110,9 @@ In PowerShell, set the environment variable with `$env:LASER_REVIEWER_FRONTEND_D
 - `GET /healthz` — liveness/readiness check.
 - `GET /api/v1/profile` — public machine, assignment, and material choices.
 - `POST /api/v1/analyze` — multipart SVG analysis with assignment, material, and thickness selections.
+- `POST /api/v1/fix-strokes` — multipart, stateless generation of a separate corrected SVG for analyzer-identified cut strokes. The response is a download; the uploaded original is unchanged, and the downloaded copy must be submitted to `/api/v1/analyze` again.
 
-The API returns normalized, sanitized geometry and a versioned analysis report. Uploaded source markup is not echoed into the page.
+The analysis API returns normalized, sanitized geometry and a versioned report. Valid embedded images are returned only as safely re-encoded preview data, while linked images are never fetched. Uploaded source markup is not echoed into the page.
 
 ## Deploy to Hugging Face Spaces
 

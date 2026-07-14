@@ -1,4 +1,4 @@
-import type { AnalysisReport, AnalyzeSelection, ProfileResponse } from './types'
+import type { AnalysisReport, AnalyzeSelection, FixStrokeSelection, ProfileResponse } from './types'
 
 const errorMessage = async (response: Response): Promise<string> => {
   try {
@@ -56,6 +56,32 @@ export const analyzeSvg = async (
   }
   if (!response.ok) throw new ApiError(await errorMessage(response), response.status)
   return (await response.json()) as AnalysisReport
+}
+
+export const fixSvgStrokes = async (
+  file: File,
+  selection: FixStrokeSelection,
+  signal?: AbortSignal,
+): Promise<Blob> => {
+  const body = new FormData()
+  body.append('file', file, file.name)
+  body.append('assignment_id', selection.assignmentId)
+  body.append('expected_sha256', selection.expectedSha256)
+
+  let response: Response
+  try {
+    response = await fetch('/api/v1/fix-strokes', {
+      method: 'POST',
+      body,
+      signal,
+      headers: { Accept: 'image/svg+xml' },
+    })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    throw new ApiError('The corrected SVG service could not be reached. Try again, or make the changes in Illustrator.')
+  }
+  if (!response.ok) throw new ApiError(await errorMessage(response), response.status)
+  return response.blob()
 }
 
 export const sha256File = async (file: File): Promise<string> => {

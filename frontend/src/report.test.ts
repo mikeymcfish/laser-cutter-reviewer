@@ -30,9 +30,9 @@ const report: AnalysisReport = {
 describe('PDF report content', () => {
   it('builds concise facts with nullable preview geometry and the legacy feature fallback', () => {
     expect(reportFileFacts(report)).toEqual(expect.arrayContaining([
-      { label: 'Document', value: '304.80 × 203.20 mm' },
-      { label: 'Smallest feature', value: '0.62 mm' },
-      { label: 'Kerf estimate', value: '0.18 mm' },
+      { label: 'Document', value: '12 × 8 in' },
+      { label: 'Smallest feature', value: '0.024 in' },
+      { label: 'Kerf estimate', value: '0.007 in' },
     ]))
   })
 

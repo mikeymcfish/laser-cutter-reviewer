@@ -1,3 +1,5 @@
+import { formatInches } from './units'
+
 export type CheckStatus = 'pass' | 'blocker' | 'warning' | 'info' | 'unverified'
 
 export type Point = [number, number]
@@ -18,6 +20,9 @@ export interface Assignment {
   name?: string
   description?: string
   image_policy?: string
+  page_policy?: string
+  expected_width_mm?: number
+  expected_height_mm?: number
   [key: string]: unknown
 }
 
@@ -138,6 +143,7 @@ export interface AnalysisCheck {
   fix?: string | null
   help?: string
   object_ids?: string[]
+  fix_actions?: FixAction[]
   bounds?: Array<{
     x_mm?: number
     y_mm?: number
@@ -156,14 +162,45 @@ export interface AnalysisCheck {
   [key: string]: unknown
 }
 
+export interface FixAction {
+  id: string
+  kind: 'normalize_cut_strokes'
+  label: string
+  description: string
+  object_ids: string[]
+  count: number
+  target_color: '#000000'
+  target_stroke_width_in: 0.001
+}
+
 export interface PreviewPath {
   id: string
+  z_index: number
   operation?: string
   closed?: boolean
   stroke?: string
   stroke_width_mm?: number | null
   color?: string
   points: Point[]
+}
+
+export interface PreviewRasterAsset {
+  id: string
+  data_url: string
+  pixel_width: number
+  pixel_height: number
+  preview_width_px: number
+  preview_height_px: number
+}
+
+export interface PreviewRasterLayer {
+  id: string
+  asset_id: string
+  corners_mm: Point[]
+  opacity: number
+  blend_mode: 'multiply'
+  z_index: number
+  preserve_aspect_ratio: string
 }
 
 export interface PreviewPiece {
@@ -179,6 +216,8 @@ export interface PreviewGeometry {
   }
   paths: PreviewPath[]
   pieces: PreviewPiece[]
+  raster_assets?: PreviewRasterAsset[]
+  raster_layers?: PreviewRasterLayer[]
   valid_3d: boolean
   invalid_reason?: string | null
 }
@@ -202,6 +241,11 @@ export interface AnalyzeSelection {
   thicknessMm: number
 }
 
+export interface FixStrokeSelection {
+  assignmentId: string
+  expectedSha256: string
+}
+
 export const checkStatus = (check: AnalysisCheck): CheckStatus => {
   const value = String(check.state ?? check.status ?? check.severity ?? '').trim().toLowerCase()
   if (['fail', 'failed', 'error', 'critical', 'block', 'blocked', 'blocker'].includes(value)) return 'blocker'
@@ -218,9 +262,9 @@ export const materialThicknesses = (material?: Material): Array<{ value: number;
   const source = material.thicknesses_mm ?? material.thicknesses ?? []
   return source
     .map((item) => {
-      if (typeof item === 'number') return { value: item, label: `${item} mm` }
+      if (typeof item === 'number') return { value: item, label: formatInches(item) }
       const value = Number(item.value_mm ?? item.thickness_mm)
-      return { value, label: item.label ?? `${value} mm` }
+      return { value, label: formatInches(value) }
     })
     .filter((item) => Number.isFinite(item.value) && item.value > 0)
 }

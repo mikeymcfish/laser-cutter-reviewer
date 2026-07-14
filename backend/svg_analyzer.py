@@ -12,6 +12,7 @@ import hashlib
 import io
 import math
 import re
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import PurePath
@@ -36,11 +37,15 @@ from .models import (
     CheckResult,
     DocumentInfo,
     FileInfo,
+    FixAction,
     LabProfile,
     MaterialProfile,
     PreviewGeometry,
     PreviewPath,
     PreviewPiece,
+    PreviewRasterAsset,
+    PreviewRasterLayer,
+    ProcessProfile,
     ProfileReference,
     ReportSummary,
     Selection,
@@ -56,7 +61,22 @@ CURVE_CHORD_ERROR_MM = 0.03
 MAX_FLATTENED_CHORD_MM = 0.5
 MAX_CURVE_SUBDIVISION_DEPTH = 14
 MAX_PAIRWISE_GEOMETRY_CHECKS = 100_000
+TRANSPARENT_PNG_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAFgAI/7f0M"
+    "WQAAAABJRU5ErkJggg=="
+)
 DRAWABLE_TAGS = {"path", "rect", "circle", "ellipse", "line", "polyline", "polygon"}
+PRESERVE_ASPECT_RATIO_ALIGNMENTS = {
+    "xMinYMin", "xMidYMin", "xMaxYMin",
+    "xMinYMid", "xMidYMid", "xMaxYMid",
+    "xMinYMax", "xMidYMax", "xMaxYMax",
+}
+SUPPORTED_RASTER_MIME_FORMATS = {
+    "image/png": "PNG",
+    "image/jpeg": "JPEG",
+    "image/jpg": "JPEG",
+}
 PRESENTATION_KEYS = {
     "display",
     "visibility",
@@ -103,6 +123,16 @@ class UnsafeSVGError(SVGAnalysisError):
     """The file contains active or externally referenced content."""
 
 
+class StrokeFixError(SVGAnalysisError):
+    """A safe, student-facing reason a corrected copy cannot be produced."""
+
+
+@dataclass
+class FixedSVG:
+    data: bytes
+    changed_source_ids: list[str]
+
+
 @dataclass
 class DocumentScale:
     width_mm: float | None
@@ -120,6 +150,8 @@ class ElementMeta:
     hidden: bool
     unsupported_effects: list[str] = field(default_factory=list)
     ambiguous_transform: bool = False
+    generated_id: bool = False
+    source_order: int = 0
 
 
 @dataclass
@@ -140,6 +172,30 @@ def _local_name(tag: str) -> str:
 def _round(value: float, digits: int = 4) -> float:
     rounded = round(float(value), digits)
     return 0.0 if rounded == -0.0 else rounded
+
+
+def _format_inches(value_mm: float, digits: int = 4) -> str:
+    return f"{value_mm / 25.4:.{digits}f} in"
+
+
+def _format_square_inches(value_mm2: float, digits: int = 4) -> str:
+    return f"{value_mm2 / (25.4 * 25.4):.{digits}f} in\u00b2"
+
+
+def _sanitize_preserve_aspect_ratio(value: str | None) -> str:
+    text = " ".join((value or "").split())
+    if text == "none":
+        return "none"
+    parts = text.split()
+    if len(parts) == 1 and parts[0] in PRESERVE_ASPECT_RATIO_ALIGNMENTS:
+        return f"{parts[0]} meet"
+    if (
+        len(parts) == 2
+        and parts[0] in PRESERVE_ASPECT_RATIO_ALIGNMENTS
+        and parts[1] in {"meet", "slice"}
+    ):
+        return text
+    return "xMidYMid meet"
 
 
 def _point_xy(point: Any) -> tuple[float, float]:
@@ -314,7 +370,10 @@ def _css_rules(root: StdET.Element) -> tuple[list[tuple[str, dict[str, str]]], l
     for element in root.iter():
         if _local_name(element.tag) != "style":
             continue
-        css = CSS_COMMENT_RE.sub("", element.text or "")
+        raw_css = element.text or ""
+        css = CSS_COMMENT_RE.sub("", raw_css)
+        if "!" in raw_css:
+            unsupported.append("CSS priority (!important) declarations")
         if "@import" in css.lower():
             raise UnsafeSVGError("External CSS imports are not allowed.")
         for _, target in URL_RE.findall(css):
@@ -408,6 +467,7 @@ def _collect_metadata(
         tag = _local_name(element.tag)
         style = _style_for(element, inherited, rules)
         declared_id = element.get("id")
+        generated_id = False
         if declared_id:
             occurrence = id_counts.get(declared_id, 0) + 1
             id_counts[declared_id] = occurrence
@@ -417,6 +477,8 @@ def _collect_metadata(
         hidden = parent_hidden or _is_hidden(style)
         ambiguous = parent_ambiguous or _is_ambiguous_transform(element.get("transform"))
         own_effects: list[str] = []
+        if "!" in (element.get("style") or ""):
+            own_effects.append("inline CSS priority (!important) declaration")
         for key in ("clip-path", "mask", "filter"):
             value = style.get(key) or element.get(key)
             if value and value.strip().lower() != "none":
@@ -442,6 +504,7 @@ def _collect_metadata(
             sequence += 1
             if not element.get("id"):
                 element.set("id", f"object-{sequence:04d}")
+                generated_id = True
             object_id = element.get("id", f"object-{sequence:04d}")
             effects = list(dict.fromkeys(inherited_effects + own_effects))
             metadata[object_id] = ElementMeta(
@@ -451,6 +514,8 @@ def _collect_metadata(
                 hidden=hidden,
                 unsupported_effects=effects,
                 ambiguous_transform=ambiguous,
+                generated_id=generated_id,
+                source_order=sequence - 1,
             )
             if hidden:
                 hidden_count += 1
@@ -528,22 +593,51 @@ def _validate_xml_safety(data: bytes, limits: Any) -> tuple[StdET.Element, str]:
             attr = _local_name(key).lower()
             stripped = value.strip()
             lowered = stripped.lower()
+            linked_image_reference = (
+                tag == "image"
+                and attr in {"href", "src"}
+                and bool(lowered)
+                and not lowered.startswith(("#", "data:"))
+            )
             if attr == "id" and (len(stripped) > 255 or any(not character.isprintable() for character in stripped)):
                 raise SVGAnalysisError("SVG object IDs must be printable and no longer than 255 characters.")
             if attr.startswith("on"):
                 raise UnsafeSVGError(f"Event handler attribute {attr} is not allowed.")
             if attr in {"href", "src"}:
-                if lowered and not lowered.startswith(("#", "data:")):
+                if lowered and not lowered.startswith(("#", "data:")) and not linked_image_reference:
                     raise UnsafeSVGError("External linked resources are not allowed.")
             if "url(" in lowered:
                 for _, target in URL_RE.findall(stripped):
                     target = target.strip().lower()
                     if target and not target.startswith(("#", "data:")):
                         raise UnsafeSVGError("External URL references are not allowed.")
-            if any(scheme in lowered for scheme in ("javascript:", "file:", "http:", "https:")):
+            if "javascript:" in lowered or (
+                any(scheme in lowered for scheme in ("file:", "http:", "https:"))
+                and not linked_image_reference
+            ):
                 raise UnsafeSVGError("External or executable URL schemes are not allowed.")
         stack.extend((child, depth + 1) for child in element)
     return root, text
+
+
+def _neutralize_image_payloads(root: StdET.Element) -> None:
+    """Replace every image payload before any geometry library sees the XML.
+
+    The inventory safely validates and re-encodes embedded pixels first. This
+    placeholder preserves placement geometry while making external I/O and
+    nested payload interpretation impossible during normalization.
+    """
+    for element in root.iter():
+        if _local_name(element.tag).lower() != "image":
+            continue
+        found_reference = False
+        for attribute in ("href", "{http://www.w3.org/1999/xlink}href", "src"):
+            value = element.get(attribute)
+            if value:
+                element.set(attribute, TRANSPARENT_PNG_DATA_URI)
+                found_reference = True
+        if not found_reference:
+            element.set("href", TRANSPARENT_PNG_DATA_URI)
 
 
 def _normalize_color(value: Any) -> str | None:
@@ -608,27 +702,100 @@ def _embedded_fonts(root: StdET.Element, max_bytes: int) -> tuple[set[str], list
     return families, errors
 
 
+def _safe_png_preview(image: Image.Image, limits: Any, remaining_bytes: int) -> tuple[str | None, int, int]:
+    byte_limit = min(limits.max_raster_preview_bytes, remaining_bytes)
+    if byte_limit <= 0:
+        return None, image.width, image.height
+    preview = image.convert("RGBA")
+    preview.thumbnail(
+        (limits.max_raster_preview_dimension_px, limits.max_raster_preview_dimension_px),
+        Image.Resampling.LANCZOS,
+    )
+    while preview.width > 0 and preview.height > 0:
+        output = io.BytesIO()
+        preview.save(output, format="PNG", optimize=True)
+        encoded = output.getvalue()
+        if len(encoded) <= byte_limit:
+            return (
+                "data:image/png;base64," + base64.b64encode(encoded).decode("ascii"),
+                preview.width,
+                preview.height,
+            )
+        if preview.width <= 16 and preview.height <= 16:
+            break
+        preview = preview.resize(
+            (max(1, int(preview.width * 0.75)), max(1, int(preview.height * 0.75))),
+            Image.Resampling.LANCZOS,
+        )
+    return None, preview.width, preview.height
+
+
+def _image_references(element: StdET.Element) -> list[str]:
+    references: list[str] = []
+    for key, value in element.attrib.items():
+        if _local_name(key).lower() in {"href", "src"} and value.strip():
+            references.append(value.strip())
+    return references
+
+
 def _image_inventory(
     root: StdET.Element,
     metadata: dict[str, ElementMeta],
-    max_bytes: int,
+    limits: Any,
 ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     images: list[dict[str, Any]] = []
     external: list[str] = []
     invalid: list[str] = []
+    preview_bytes_used = 0
+    embedded_image_count = 0
+    decoded_pixels_used = 0
     for element in root.iter():
         if _local_name(element.tag) != "image":
             continue
         object_id = element.get("id", "image")
-        href = element.get("href") or element.get("{http://www.w3.org/1999/xlink}href") or ""
-        if not href.lower().startswith("data:"):
+        references = _image_references(element)
+        if any(not reference.lower().startswith(("data:", "#")) for reference in references):
             external.append(object_id)
             continue
+        if (
+            not references
+            or any(not reference.lower().startswith("data:") for reference in references)
+            or len(set(references)) != 1
+        ):
+            invalid.append(object_id)
+            continue
+        data_references = references
+        embedded_image_count += 1
+        if embedded_image_count > limits.max_embedded_images:
+            invalid.append(object_id)
+            continue
+        href = data_references[0]
         try:
-            media_type, decoded = _decode_data_uri(href, max_bytes)
-            with Image.open(io.BytesIO(decoded)) as image:
-                pixel_width, pixel_height = image.size
-                image.verify()
+            media_type, decoded = _decode_data_uri(href, limits.max_upload_bytes)
+            expected_format = SUPPORTED_RASTER_MIME_FORMATS.get(media_type)
+            if expected_format is None:
+                raise ValueError("embedded image MIME type is not a supported raster format")
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(io.BytesIO(decoded)) as image:
+                    if image.format != expected_format:
+                        raise ValueError("embedded image MIME type does not match its decoded format")
+                    pixel_width, pixel_height = image.size
+                    image_pixels = pixel_width * pixel_height
+                    if image_pixels > limits.max_embedded_image_pixels:
+                        raise ValueError("embedded image exceeds the decoded-pixel limit")
+                    if decoded_pixels_used + image_pixels > limits.max_total_embedded_image_pixels:
+                        raise ValueError("embedded images exceed the cumulative decoded-pixel limit")
+                    decoded_pixels_used += image_pixels
+                    image.seek(0)
+                    image.load()
+                    preview_data_url, preview_width, preview_height = _safe_png_preview(
+                        image,
+                        limits,
+                        limits.max_total_raster_preview_bytes - preview_bytes_used,
+                    )
+            if preview_data_url:
+                preview_bytes_used += len(base64.b64decode(preview_data_url.split(",", 1)[1]))
             width_mm, _, _ = _parse_length(element.get("width"))
             height_mm, _, _ = _parse_length(element.get("height"))
             dpi = None
@@ -642,6 +809,13 @@ def _image_inventory(
                     "pixel_height": pixel_height,
                     "effective_dpi": _round(dpi, 1) if dpi else None,
                     "hidden": metadata.get(object_id).hidden if object_id in metadata else False,
+                    "opacity": _image_opacity(metadata.get(object_id)),
+                    "preview_data_url": preview_data_url,
+                    "preview_pixel_width": preview_width,
+                    "preview_pixel_height": preview_height,
+                    "preserve_aspect_ratio": _sanitize_preserve_aspect_ratio(
+                        element.get("preserveAspectRatio")
+                    ),
                 }
             )
         except (
@@ -649,10 +823,20 @@ def _image_inventory(
             OSError,
             UnidentifiedImageError,
             Image.DecompressionBombError,
+            Image.DecompressionBombWarning,
             base64.binascii.Error,
         ):
             invalid.append(object_id)
     return images, external, invalid
+
+
+def _image_opacity(meta: ElementMeta | None) -> float:
+    if meta is None:
+        return 1.0
+    try:
+        return min(1.0, max(0.0, float(meta.style.get("opacity", "1"))))
+    except ValueError:
+        return 1.0
 
 
 def _live_text_inventory(
@@ -859,6 +1043,7 @@ def _extract_paths(
     assignment: AssignmentProfile,
     hairline_threshold_mm: float,
     limits: Any,
+    non_renderable_image_ids: set[str] | None = None,
 ) -> tuple[list[ExtractedPath], int, int]:
     try:
         svg = SVG.parse(io.StringIO(xml_text), ppi=96, reify=False)
@@ -873,6 +1058,7 @@ def _extract_paths(
     preview_id_counts: dict[str, int] = {}
     use_instances, use_renderable_counts = _use_expansion_context(xml_text)
     emitted_for_use_target: dict[str, int] = {}
+    non_renderable_image_ids = non_renderable_image_ids or set()
 
     def object_identity(element: Any, fallback: str) -> tuple[str, str, ElementMeta | None, dict[str, Any]]:
         values = getattr(element, "values", {}) or {}
@@ -937,6 +1123,7 @@ def _extract_paths(
                 raise SVGAnalysisError(f"Live-text bounds on {source_id} could not be normalized.")
             preview = PreviewPath(
                 id=object_id,
+                z_index=meta.source_order if meta else max(0, object_index - 1),
                 operation="engrave-text",
                 closed=True,
                 stroke="#b26a56",
@@ -979,8 +1166,12 @@ def _extract_paths(
                 width = float(element.width)
                 height = float(element.height)
             except (TypeError, ValueError) as exc:
+                if source_id in non_renderable_image_ids:
+                    continue
                 raise SVGAnalysisError(f"Raster image bounds on {source_id} are unresolved.") from exc
             if any(not math.isfinite(item) for item in (x, y, width, height)) or width <= 0 or height <= 0:
+                if source_id in non_renderable_image_ids:
+                    continue
                 raise SVGAnalysisError(f"Raster image bounds on {source_id} are non-finite or invalid.")
             matrix = getattr(element, "transform", None)
             corners_px = [
@@ -997,6 +1188,7 @@ def _extract_paths(
             line = LineString(coords_mm)
             preview = PreviewPath(
                 id=object_id,
+                z_index=meta.source_order if meta else max(0, object_index - 1),
                 operation="raster-engrave",
                 closed=True,
                 points=[[_round(px), _round(py)] for px, py in coords_mm],
@@ -1066,9 +1258,17 @@ def _extract_paths(
             if color == process.color and abs(stroke_width_mm - process.stroke_width_mm) <= process.stroke_tolerance_mm:
                 approved_process = process
                 break
+        configured_process_color = any(color == process.color for process in assignment.processes)
         if approved_process:
             operation = approved_process.id
-        elif color is not None and stroke_width_mm <= hairline_threshold_mm + 1e-6:
+        elif color is not None and (
+            stroke_width_mm <= hairline_threshold_mm + 1e-6
+            or (
+                fill is None
+                and configured_process_color
+                and stroke_width_mm <= limits.max_fixable_cut_stroke_width_mm + 1e-6
+            )
+        ):
             operation = "unassigned-vector"
         elif color is not None or fill is not None:
             operation = "engrave"
@@ -1106,6 +1306,7 @@ def _extract_paths(
             )
             preview = PreviewPath(
                 id=object_id,
+                z_index=meta.source_order if meta else max(0, object_index - 1),
                 operation=operation,
                 closed=closed,
                 stroke=preview_stroke,
@@ -1159,6 +1360,54 @@ def _preview_ids_for_source_ids(
         or any(item.preview.id.startswith(f"{object_id}--") for object_id in wanted)
     ]
     return list(dict.fromkeys(matched)) or sorted(wanted)
+
+
+def _fixable_stroke_paths(
+    paths: Iterable[ExtractedPath],
+    metadata: dict[str, ElementMeta],
+    assignment: AssignmentProfile,
+    hairline_threshold_mm: float,
+    max_fixable_width_mm: float,
+) -> list[ExtractedPath]:
+    """Return deterministic, source-backed cut candidates safe to restyle."""
+    result: list[ExtractedPath] = []
+    seen_preview_ids: set[str] = set()
+    other_process_colors = {
+        process.color for process in assignment.processes if process.color != "#000000"
+    }
+    for item in paths:
+        meta = metadata.get(item.source_id)
+        dashed = bool(item.dash and item.dash.strip().lower() not in {"", "0", "none"})
+        width_mm = item.preview.stroke_width_mm
+        same_process_wrong_width = bool(
+            item.color == "#000000"
+            and item.fill is None
+            and width_mm is not None
+            and width_mm <= max_fixable_width_mm + 1e-6
+        )
+        wrong_color_hairline = bool(
+            item.color != "#000000"
+            and item.color not in other_process_colors
+            and width_mm is not None
+            and width_mm <= hairline_threshold_mm + 1e-6
+        )
+        if (
+            item.preview.operation != "unassigned-vector"
+            or not (same_process_wrong_width or wrong_color_hairline)
+            or item.ambiguous_transform
+            or dashed
+            or meta is None
+            or meta.tag not in DRAWABLE_TAGS
+            or meta.hidden
+            or meta.unsupported_effects
+            or item.color in other_process_colors
+            or item.preview.id != item.source_id
+            or item.preview.id in seen_preview_ids
+        ):
+            continue
+        result.append(item)
+        seen_preview_ids.add(item.preview.id)
+    return result
 
 
 def _polygon_for_path(item: ExtractedPath) -> Polygon | None:
@@ -1223,6 +1472,7 @@ def _add_check(
     fix: str | None = None,
     object_ids: Iterable[str] = (),
     bounds: Iterable[Bounds] = (),
+    fix_actions: Iterable[FixAction] = (),
 ) -> None:
     checks.append(
         CheckResult(
@@ -1234,6 +1484,7 @@ def _add_check(
             fix=fix,
             object_ids=list(object_ids),
             bounds=list(bounds),
+            fix_actions=list(fix_actions),
         )
     )
 
@@ -1354,6 +1605,134 @@ def failure_report(
     )
 
 
+def _stroke_fix_target(assignment: AssignmentProfile) -> ProcessProfile:
+    matches = [
+        process for process in assignment.processes
+        if process.color == "#000000" and abs(process.stroke_width_mm - 0.0254) <= 1e-9
+    ]
+    if len(matches) != 1:
+        raise StrokeFixError("This assignment does not define one unambiguous black 0.001 in cut process.")
+    return matches[0]
+
+
+def _set_inline_cut_style(element: StdET.Element) -> None:
+    declarations = _declarations(element.get("style"))
+    declarations.update(
+        {
+            "stroke": "#000000",
+            "stroke-width": "0.001in",
+            "vector-effect": "non-scaling-stroke",
+        }
+    )
+    element.set("style", ";".join(f"{key}:{value}" for key, value in declarations.items()))
+    element.set("stroke", "#000000")
+    element.set("stroke-width", "0.001in")
+    element.set("vector-effect", "non-scaling-stroke")
+
+
+def fix_strokes(
+    *,
+    data: bytes,
+    expected_sha256: str,
+    profile: LabProfile,
+    assignment: AssignmentProfile,
+) -> FixedSVG:
+    """Return a corrected copy containing only verified cut-stroke style changes."""
+    actual_sha256 = hashlib.sha256(data).hexdigest()
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256) or actual_sha256 != expected_sha256.lower():
+        raise StrokeFixError(
+            "The selected SVG no longer matches the analyzed file. Analyze it again before downloading a corrected copy."
+        )
+    target_process = _stroke_fix_target(assignment)
+    root, _ = _validate_xml_safety(data, profile.limits)
+    if any(_local_name(element.tag).lower() == "use" for element in root.iter()):
+        raise StrokeFixError(
+            "Automatic stroke correction is unavailable for SVGs that contain reusable <use> instances."
+        )
+    scale = _document_scale(root)
+    rules, unsupported_css = _css_rules(root)
+    metadata, unsupported_effects, _, duplicate_source_ids = _collect_metadata(root, rules)
+    _, external_images, invalid_images = _image_inventory(root, metadata, profile.limits)
+    if duplicate_source_ids:
+        raise StrokeFixError("Duplicate object IDs make a safe targeted stroke correction impossible.")
+    if unsupported_css or unsupported_effects:
+        raise StrokeFixError("Unsupported SVG effects or CSS make a safe targeted stroke correction impossible.")
+    if external_images or invalid_images:
+        raise StrokeFixError("Embed or replace every raster image before creating a corrected SVG copy.")
+    analysis_root = StdET.fromstring(StdET.tostring(root, encoding="utf-8"))
+    _neutralize_image_payloads(analysis_root)
+    if scale.width_mm and not analysis_root.get("width"):
+        analysis_root.set("width", f"{scale.width_mm / MM_PER_PX}px")
+    if scale.height_mm and not analysis_root.get("height"):
+        analysis_root.set("height", f"{scale.height_mm / MM_PER_PX}px")
+    normalized_xml = StdET.tostring(analysis_root, encoding="unicode")
+    paths, _, _ = _extract_paths(
+        normalized_xml,
+        metadata,
+        assignment,
+        profile.machine.vector_hairline_threshold_mm,
+        profile.limits,
+    )
+    candidates = _fixable_stroke_paths(
+        paths,
+        metadata,
+        assignment,
+        profile.machine.vector_hairline_threshold_mm,
+        profile.limits.max_fixable_cut_stroke_width_mm,
+    )
+    source_ids = sorted({item.source_id for item in candidates})
+    if not source_ids:
+        raise StrokeFixError("No analyzer-identified cut strokes are eligible for automatic correction.")
+
+    source_id_set = set(source_ids)
+    changed = 0
+    for element in root.iter():
+        if element.get("id") in source_id_set:
+            _set_inline_cut_style(element)
+            changed += 1
+    if changed != len(source_ids):
+        raise StrokeFixError("The highlighted SVG objects could not be mapped back to unique source elements.")
+
+    for element in root.iter():
+        element_id = element.get("id")
+        if element_id and metadata.get(element_id) and metadata[element_id].generated_id:
+            element.attrib.pop("id", None)
+
+    StdET.register_namespace("", "http://www.w3.org/2000/svg")
+    fixed_data = StdET.tostring(root, encoding="utf-8", xml_declaration=True)
+    if len(fixed_data) > profile.limits.max_upload_bytes:
+        raise StrokeFixError("The corrected SVG would exceed the upload size limit.")
+
+    # Re-run the same parser on the output. The copy is only returned when each
+    # changed source now resolves to the configured cut process at 0.001 in.
+    verify_root, _ = _validate_xml_safety(fixed_data, profile.limits)
+    verify_scale = _document_scale(verify_root)
+    verify_rules, verify_css = _css_rules(verify_root)
+    verify_metadata, verify_effects, _, verify_duplicates = _collect_metadata(verify_root, verify_rules)
+    if verify_css or verify_effects or verify_duplicates:
+        raise StrokeFixError("The corrected SVG did not pass the required safety verification.")
+    if verify_scale.width_mm and not verify_root.get("width"):
+        verify_root.set("width", f"{verify_scale.width_mm / MM_PER_PX}px")
+    if verify_scale.height_mm and not verify_root.get("height"):
+        verify_root.set("height", f"{verify_scale.height_mm / MM_PER_PX}px")
+    _neutralize_image_payloads(verify_root)
+    verify_paths, _, _ = _extract_paths(
+        StdET.tostring(verify_root, encoding="unicode"),
+        verify_metadata,
+        assignment,
+        profile.machine.vector_hairline_threshold_mm,
+        profile.limits,
+    )
+    changed_verify_paths = [item for item in verify_paths if item.source_id in source_id_set]
+    verified_sources = {item.source_id for item in changed_verify_paths}
+    if (
+        verified_sources != source_id_set
+        or any(item.preview.operation != target_process.id for item in changed_verify_paths)
+    ):
+        raise StrokeFixError("The corrected strokes did not re-analyze as exact black 0.001 in cuts.")
+    return FixedSVG(data=fixed_data, changed_source_ids=source_ids)
+
+
 def analyze_svg(
     *,
     data: bytes,
@@ -1366,14 +1745,16 @@ def analyze_svg(
     """Analyze one SVG upload and return only normalized, JSON-safe data."""
     try:
         root, _ = _validate_xml_safety(data, profile.limits)
+        has_use_elements = any(_local_name(element.tag).lower() == "use" for element in root.iter())
         scale = _document_scale(root)
         rules, unsupported_css = _css_rules(root)
         metadata, unsupported_effects, hidden_count, duplicate_source_ids = _collect_metadata(root, rules)
         embedded_families, font_errors = _embedded_fonts(root, profile.limits.max_upload_bytes)
         images, external_images, invalid_images = _image_inventory(
-            root, metadata, profile.limits.max_upload_bytes
+            root, metadata, profile.limits
         )
         embedded_text, missing_text = _live_text_inventory(root, metadata, embedded_families)
+        _neutralize_image_payloads(root)
         # Give inferred documents an explicit internal viewport so svgelements'
         # default 300x150 viewport cannot distort normalized output.
         if scale.width_mm and not root.get("width"):
@@ -1387,9 +1768,12 @@ def analyze_svg(
             assignment,
             profile.machine.vector_hairline_threshold_mm,
             profile.limits,
+            set(external_images + invalid_images),
         )
         raster_paths = [item for item in paths if item.preview.operation == "raster-engrave"]
-        for image in images:
+        raster_assets: list[PreviewRasterAsset] = []
+        raster_layers: list[PreviewRasterLayer] = []
+        for image_index, image in enumerate(images, start=1):
             placements = [item for item in raster_paths if item.source_id == image["id"]]
             image["preview_ids"] = [item.preview.id for item in placements] or [image["id"]]
             image["bounds"] = [item.preview.bounds for item in placements if item.preview.bounds]
@@ -1405,6 +1789,31 @@ def analyze_svg(
                     )
             if dpi_values:
                 image["effective_dpi"] = _round(min(dpi_values), 1)
+            if image["preview_data_url"]:
+                asset_id = f"raster-asset-{image_index:04d}"
+                raster_assets.append(
+                    PreviewRasterAsset(
+                        id=asset_id,
+                        data_url=image["preview_data_url"],
+                        pixel_width=image["pixel_width"],
+                        pixel_height=image["pixel_height"],
+                        preview_width_px=image["preview_pixel_width"],
+                        preview_height_px=image["preview_pixel_height"],
+                    )
+                )
+                for placement in placements:
+                    corners = placement.preview.points[:4]
+                    if len(corners) == 4:
+                        raster_layers.append(
+                            PreviewRasterLayer(
+                                id=placement.preview.id,
+                                asset_id=asset_id,
+                                z_index=placement.preview.z_index,
+                                corners_mm=corners,
+                                opacity=image["opacity"],
+                                preserve_aspect_ratio=image["preserve_aspect_ratio"],
+                            )
+                        )
     except UnsafeSVGError as exc:
         return failure_report(
             data=data,
@@ -1429,6 +1838,7 @@ def analyze_svg(
             message=str(exc),
         )
 
+    effects = unsupported_effects + unsupported_css
     checks: list[CheckResult] = []
     _add_check(
         checks,
@@ -1478,7 +1888,10 @@ def analyze_svg(
             title="Document scale and units",
             state="warning",
             message="Physical size was inferred using 96 CSS pixels per inch.",
-            evidence=[f"Interpreted as {document.width_mm} x {document.height_mm} mm"],
+            evidence=[
+                f"Interpreted as {_format_inches(document.width_mm or 0)} x "
+                f"{_format_inches(document.height_mm or 0)}"
+            ],
             fix="Export with explicit in, mm, cm, pt, pc, or px width and height values.",
         )
     else:
@@ -1488,7 +1901,10 @@ def analyze_svg(
             title="Document scale and units",
             state="pass",
             message="The document declares a physical viewport.",
-            evidence=[f"{document.width_mm} x {document.height_mm} mm; source units: {scale.units}"],
+            evidence=[
+                f"{_format_inches(document.width_mm or 0)} x "
+                f"{_format_inches(document.height_mm or 0)}; source units: {scale.units}"
+            ],
         )
 
     page_ok = scale.width_mm is not None and scale.height_mm is not None
@@ -1497,8 +1913,9 @@ def analyze_svg(
         expected_w = assignment.expected_width_mm or 0
         expected_h = assignment.expected_height_mm or 0
         page_evidence = [
-            f"Measured {scale.width_mm:.3f} x {scale.height_mm:.3f} mm",
-            f"Expected {expected_w:.3f} x {expected_h:.3f} mm ± {assignment.page_tolerance_mm:.3f} mm",
+            f"Measured {_format_inches(scale.width_mm)} x {_format_inches(scale.height_mm)}",
+            f"Expected {_format_inches(expected_w)} x {_format_inches(expected_h)} "
+            f"+/- {_format_inches(assignment.page_tolerance_mm)}",
         ]
         page_ok = (
             abs(scale.width_mm - expected_w) <= assignment.page_tolerance_mm
@@ -1506,8 +1923,9 @@ def analyze_svg(
         )
     elif page_ok:
         page_evidence = [
-            f"Document {scale.width_mm:.3f} x {scale.height_mm:.3f} mm",
-            f"Usable bed {profile.machine.usable_width_mm:.3f} x {profile.machine.usable_height_mm:.3f} mm",
+            f"Document {_format_inches(scale.width_mm)} x {_format_inches(scale.height_mm)}",
+            f"Usable bed {_format_inches(profile.machine.usable_width_mm)} x "
+            f"{_format_inches(profile.machine.usable_height_mm)}",
         ]
         page_ok = (
             scale.width_mm <= profile.machine.usable_width_mm + assignment.page_tolerance_mm
@@ -1559,7 +1977,8 @@ def analyze_svg(
     ambiguous_vectors = [item for item in approved_paths + unassigned_vectors if item.ambiguous_transform]
     process_bad = list({item.preview.id: item for item in unassigned_vectors + dashed_cuts + ambiguous_vectors}.values())
     process_evidence = [
-        f"{item.preview.id}: stroke {item.color}, width {item.preview.stroke_width_mm} mm"
+        f"{item.preview.id}: stroke {item.color}, width "
+        f"{_format_inches(item.preview.stroke_width_mm or 0, 5)}"
         for item in unassigned_vectors[:20]
     ]
     process_evidence.extend(f"{item.preview.id}: dashed cut stroke" for item in dashed_cuts[:20])
@@ -1568,6 +1987,38 @@ def analyze_svg(
         process_evidence.append("No approved cut or score vectors were found.")
     process_blocked = bool(process_bad or not approved_paths)
     process_references = process_bad or (vector_paths if not approved_paths else [])
+    target_processes = [
+        process for process in assignment.processes
+        if process.color == "#000000" and abs(process.stroke_width_mm - 0.0254) <= 1e-9
+    ]
+    fixable_paths = _fixable_stroke_paths(
+        unassigned_vectors,
+        metadata,
+        assignment,
+        profile.machine.vector_hairline_threshold_mm,
+        profile.limits.max_fixable_cut_stroke_width_mm,
+    )
+    can_offer_stroke_fix = bool(
+        fixable_paths
+        and len(target_processes) == 1
+        and not duplicate_source_ids
+        and not effects
+        and not external_images
+        and not invalid_images
+        and not has_use_elements
+    )
+    process_fix_actions = [
+        FixAction(
+            id="normalize-cut-strokes",
+            label=f"Download a corrected copy ({len(fixable_paths)} stroke(s))",
+            description=(
+                "Creates a separate SVG copy with the highlighted likely-cut strokes set to "
+                "black, 0.001 in, and non-scaling. The original file is unchanged."
+            ),
+            object_ids=[item.preview.id for item in fixable_paths],
+            count=len(fixable_paths),
+        )
+    ] if can_offer_stroke_fix else []
     _add_check(
         checks,
         rule_id="vectors.process_setup",
@@ -1582,6 +2033,7 @@ def analyze_svg(
         fix=None if not process_blocked else "In Illustrator, use the assignment cut color, a solid 0.001 in stroke, and avoid non-uniform scaling of stroked paths.",
         object_ids=[item.preview.id for item in process_references],
         bounds=[item.preview.bounds for item in process_references if item.preview.bounds],
+        fix_actions=process_fix_actions,
     )
 
     unintended_hairlines = [
@@ -1595,7 +2047,10 @@ def analyze_svg(
         title="No unintended vector hairlines",
         state="blocker" if unintended_hairlines else "pass",
         message=f"{len(unintended_hairlines)} unapproved hairline(s) could be sent as vectors." if unintended_hairlines else "No unapproved vector-weight strokes were found.",
-        evidence=[f"{item.preview.id}: {item.preview.stroke_width_mm} mm" for item in unintended_hairlines[:20]],
+        evidence=[
+            f"{item.preview.id}: {_format_inches(item.preview.stroke_width_mm or 0, 5)}"
+            for item in unintended_hairlines[:20]
+        ],
         fix="Remove stray strokes or assign each highlighted hairline to an approved cut/score process." if unintended_hairlines else None,
         object_ids=[item.preview.id for item in unintended_hairlines],
         bounds=[item.preview.bounds for item in unintended_hairlines if item.preview.bounds],
@@ -1703,7 +2158,6 @@ def analyze_svg(
         bounds=_bounds_for_ids(paths, crossing_ids),
     )
 
-    effects = unsupported_effects + unsupported_css
     effect_source_ids = sorted({entry.split(":", 1)[0] for entry in unsupported_effects})
     effect_preview_ids = _preview_ids_for_source_ids(paths, effect_source_ids)
     _add_check(
@@ -1720,15 +2174,29 @@ def analyze_svg(
 
     if external_images or invalid_images:
         resource_ids = external_images + invalid_images
+        if external_images:
+            resource_message = (
+                "A linked image is only a pointer to a file on the computer that created this SVG. "
+                "The review Space and laser workstation cannot access those pixels, so the engraving "
+                "could be missing or different. Embed the image so its pixels travel inside the SVG."
+            )
+        else:
+            resource_message = "One or more embedded raster images could not be decoded safely."
+        resource_evidence = [f"Linked image object: {item}" for item in external_images]
+        resource_evidence.extend(f"Unreadable embedded image object: {item}" for item in invalid_images)
         _add_check(
             checks,
             rule_id="assets.images_embedded",
             title="Images are embedded and readable",
             state="blocker",
-            message="One or more raster images are linked or invalid.",
-            evidence=[f"Affected image: {item}" for item in resource_ids],
-            fix="Use Illustrator's Links panel to embed each image, then export a fresh SVG.",
+            message=resource_message,
+            evidence=resource_evidence,
+            fix=(
+                "In Illustrator, open Window > Links, select each linked image, choose Embed Image(s), "
+                "then export a fresh SVG."
+            ),
             object_ids=resource_ids,
+            bounds=_bounds_for_ids(paths, resource_ids),
         )
     else:
         _add_check(
@@ -1832,14 +2300,22 @@ def analyze_svg(
     dense = bool(page_area and cut_density > material.heat_density_threshold_mm_per_mm2)
     fragility_evidence: list[str] = []
     if close_ids:
-        fragility_evidence.append(f"{len(close_ids)} path(s) are closer than {material.min_spacing_mm} mm")
+        fragility_evidence.append(
+            f"{len(close_ids)} path(s) are closer than {_format_inches(material.min_spacing_mm)}"
+        )
     if tiny_ids:
-        fragility_evidence.append(f"{len(tiny_ids)} enclosed region(s) are below {material.min_piece_area_mm2} mm²")
+        fragility_evidence.append(
+            f"{len(tiny_ids)} enclosed region(s) are below "
+            f"{_format_square_inches(material.min_piece_area_mm2)}"
+        )
     if fragile_ids - close_ids - tiny_ids:
-        fragility_evidence.append(f"Thin features below the {material.min_bridge_mm} mm bridge guideline")
+        fragility_evidence.append(
+            f"Thin features below the {_format_inches(material.min_bridge_mm)} bridge guideline"
+        )
     if dense:
         fragility_evidence.append(
-            f"Cut density {cut_density:.3f} mm/mm² exceeds the {material.heat_density_threshold_mm_per_mm2:.3f} mm/mm² guideline"
+            f"Cut density {cut_density * 25.4:.3f} in/in² exceeds the "
+            f"{material.heat_density_threshold_mm_per_mm2 * 25.4:.3f} in/in² guideline"
         )
     _add_check(
         checks,
@@ -2007,6 +2483,8 @@ def analyze_svg(
             page={"width_mm": document.width_mm, "height_mm": document.height_mm},
             paths=[item.preview for item in paths],
             pieces=pieces,
+            raster_assets=raster_assets,
+            raster_layers=raster_layers,
             valid_3d=valid_3d,
             invalid_reason="; ".join(dict.fromkeys(invalid_3d_reasons)) if invalid_3d_reasons else None,
         ),

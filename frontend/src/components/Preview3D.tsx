@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import type { Point, PreviewGeometry } from '../types'
+import { formatInches } from '../units'
 
 interface Preview3DProps {
   geometry: PreviewGeometry
@@ -267,7 +268,7 @@ export function Preview3D({ geometry, materialType, thicknessMm, kerfMm, preview
         aria-label={`Approximate three-dimensional ${isAcrylic ? 'acrylic' : 'wood'} cut preview. Drag to orbit and scroll to zoom.`}
       />
       <p className="preview-hint">
-        Drag to orbit · Scroll to zoom · Approximate {kerfMm.toFixed(2)} mm kerf
+        Drag to orbit · Scroll to zoom · Approximate {formatInches(kerfMm)} kerf
         {showSheetReference ? ' · Translucent sheet is a size reference, not predicted scrap' : ''}
       </p>
     </div>

@@ -1,11 +1,12 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
-import { analyzeSvg, getProfile, sha256File } from './api'
+import { analyzeSvg, fixSvgStrokes, getProfile, sha256File } from './api'
 import { Checklist } from './components/Checklist'
 import { CubeIcon, DownloadIcon, InfoIcon, ResetIcon, SparkIcon, WarningIcon } from './components/Icons'
 import { Preview2D } from './components/Preview2D'
 import { UploadPanel } from './components/UploadPanel'
-import type { AnalysisCheck, AnalysisReport, CheckStatus, Material, ProfileResponse } from './types'
+import type { AnalysisCheck, AnalysisReport, CheckStatus, FixAction, Material, ProfileResponse } from './types'
 import { checkKey, checkStatus, displayName, materialThicknesses } from './types'
+import { formatDimensionsInches, formatInches } from './units'
 
 const defaultOperatorChecks = [
   'Material is instructor-approved and its SDS has been reviewed.',
@@ -35,6 +36,11 @@ const countChecks = (checks: AnalysisCheck[]) => {
 }
 
 const fileName = (report: AnalysisReport) => report.file.name ?? report.file.filename ?? 'SVG file'
+
+const correctedFileName = (name: string) => {
+  const stem = name.replace(/\.svg$/i, '').replace(/[^a-z0-9._-]+/gi, '-') || 'laser-file'
+  return `${stem}-cut-strokes-fixed.svg`
+}
 
 const metricValue = (value: unknown, suffix = '') => {
   if (value === null || value === undefined || value === '') return '—'
@@ -69,6 +75,9 @@ export default function App() {
   const [selectedCheck, setSelectedCheck] = useState<AnalysisCheck | undefined>()
   const [viewMode, setViewMode] = useState<ViewMode>('2d')
   const [manualState, setManualState] = useState<Record<number, boolean>>({})
+  const [fixingActionId, setFixingActionId] = useState<string | null>(null)
+  const [fixError, setFixError] = useState('')
+  const [fixMessage, setFixMessage] = useState('')
   const fileSelectionToken = useRef(0)
 
   const loadProfile = () => {
@@ -116,6 +125,9 @@ export default function App() {
     setAnalysisError('')
     setManualState({})
     setViewMode('2d')
+    setFixingActionId(null)
+    setFixError('')
+    setFixMessage('')
   }
 
   const onFileChange = async (candidate: File | null) => {
@@ -213,12 +225,50 @@ export default function App() {
         kerf_mm: kerfMm,
       },
     }
-    downloadReport(
+    await downloadReport(
       printableReport,
       fileHash,
       manualLabels.map((label, index) => ({ label, checked: Boolean(manualState[index]) })),
       reportReady,
     )
+  }
+
+  const onFixAction = async (action: FixAction) => {
+    if (!file || !report || !assignmentId) return
+    const expectedSha256 = (report.file.sha256 || fileHash).toLowerCase()
+    if (!expectedSha256) {
+      setFixError('The source fingerprint is unavailable. Choose the SVG again before requesting a corrected copy.')
+      return
+    }
+    const strokeLabel = `${action.count} highlighted ${action.count === 1 ? 'stroke' : 'strokes'}`
+    const confirmed = window.confirm(
+      `This will turn ${strokeLabel} into through-cuts (#000000 at 0.001 in).\n\nIf any highlighted stroke is intentional engraving, choose Cancel and correct the file in Illustrator instead.\n\nYour original SVG will stay unchanged. Download the corrected copy?`,
+    )
+    if (!confirmed) return
+    setFixingActionId(action.id)
+    setFixError('')
+    setFixMessage('')
+    try {
+      const corrected = await fixSvgStrokes(file, { assignmentId, expectedSha256 })
+      if (!corrected.size) throw new Error('The correction service returned an empty file. Make the changes in Illustrator instead.')
+      const url = URL.createObjectURL(corrected)
+      try {
+        const link = document.createElement('a')
+        link.href = url
+        link.download = correctedFileName(file.name)
+        document.body.appendChild(link)
+        link.click()
+        link.remove()
+      } finally {
+        URL.revokeObjectURL(url)
+      }
+      setFixMessage(`Corrected copy downloaded. Re-upload ${correctedFileName(file.name)} to verify the changes before submitting.`)
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
+      setFixError(error instanceof Error ? error.message : 'The corrected SVG could not be prepared.')
+    } finally {
+      setFixingActionId(null)
+    }
   }
 
   return (
@@ -329,7 +379,7 @@ export default function App() {
             <div className="result-toolbar">
               <div>
                 <strong>{fileName(report)}</strong>
-                <span>{metricValue(report.geometry.page.width_mm, ' mm')} × {metricValue(report.geometry.page.height_mm, ' mm')} · {displayName(selectedAssignment ?? { id: assignmentId })}</span>
+                <span>{formatDimensionsInches(report.geometry.page.width_mm, report.geometry.page.height_mm)} · {displayName(selectedAssignment ?? { id: assignmentId })}</span>
               </div>
               <div className="toolbar-actions">
                 <button
@@ -343,6 +393,11 @@ export default function App() {
                   <ResetIcon size={18} />
                 </button>
               </div>
+            </div>
+
+            <div className="fix-live" aria-live="polite" aria-atomic="true">
+              {fixMessage ? <div className="fix-success" role="status"><SparkIcon size={17} /><span>{fixMessage}</span></div> : null}
+              {fixError ? <div className="fix-error" role="alert"><WarningIcon size={17} /><span>{fixError}</span></div> : null}
             </div>
 
             <div className="review-layout">
@@ -381,7 +436,7 @@ export default function App() {
                   {!report.geometry.valid_3d ? (
                     <div className="three-disabled-note"><InfoIcon size={16} /><span><b>3D preview unavailable:</b> {report.geometry.invalid_reason || 'Fix invalid cut topology first.'}</span></div>
                   ) : null}
-                  <p className="preview-disclaimer">Preview is approximate. Raster images and live text are shown only as sanitized bounds; keep vs. scrap, assembly, charring, and physical strength cannot be inferred.</p>
+                  <p className="preview-disclaimer">Preview is approximate. Embedded images are sanitized and shown as multiply layers; live text is shown only as bounds. Keep vs. scrap, assembly, charring, and physical strength cannot be inferred.</p>
                 </section>
 
                 <section className="metrics-panel" aria-labelledby="metrics-title">
@@ -389,14 +444,14 @@ export default function App() {
                     <div><span className="eyebrow">File facts</span><h2 id="metrics-title">At a glance</h2></div>
                   </div>
                   <dl className="metric-grid">
-                    <div><dt>Document</dt><dd>{metricValue(report.document.width_mm ?? report.geometry.page.width_mm, ' mm')} × {metricValue(report.document.height_mm ?? report.geometry.page.height_mm, ' mm')}</dd></div>
-                    <div><dt>Scale confidence</dt><dd>{String(report.document.unit_confidence ?? report.document.units ?? 'Verified')}</dd></div>
+                    <div><dt>Document</dt><dd>{formatDimensionsInches(report.document.width_mm ?? report.geometry.page.width_mm, report.document.height_mm ?? report.geometry.page.height_mm)}</dd></div>
+                    <div><dt>Display / source scale</dt><dd>Inches · {String(report.document.unit_confidence ?? 'unverified')}</dd></div>
                     <div><dt>Objects</dt><dd>{metricValue(report.metrics.object_count ?? report.geometry.paths.length)}</dd></div>
-                    <div><dt>Cut length</dt><dd>{metricValue(report.metrics.total_cut_length_mm, ' mm')}</dd></div>
+                    <div><dt>Cut length</dt><dd>{formatInches(report.metrics.total_cut_length_mm, 2)}</dd></div>
                     <div><dt>Raster images</dt><dd>{metricValue(report.metrics.image_count ?? 0)}</dd></div>
-                    <div><dt>Smallest feature</dt><dd>{metricValue(report.metrics.minimum_feature_mm ?? report.metrics.smallest_estimated_feature_mm, ' mm')}</dd></div>
+                    <div><dt>Smallest feature</dt><dd>{formatInches(report.metrics.minimum_feature_mm ?? report.metrics.smallest_estimated_feature_mm)}</dd></div>
                     <div><dt>Material</dt><dd>{report.selection.material_label ?? displayName(selectedMaterial ?? { id: materialId })}</dd></div>
-                    <div><dt>Kerf estimate</dt><dd>{metricValue(kerfMm, ' mm')}</dd></div>
+                    <div><dt>Kerf estimate</dt><dd>{formatInches(kerfMm)}</dd></div>
                   </dl>
                 </section>
 
@@ -421,7 +476,13 @@ export default function App() {
                 </section>
               </div>
 
-              <Checklist checks={report.checks} selectedId={selectedCheck ? checkKey(selectedCheck) : null} onSelect={setSelectedCheck} />
+              <Checklist
+                checks={report.checks}
+                selectedId={selectedCheck ? checkKey(selectedCheck) : null}
+                onSelect={setSelectedCheck}
+                onFixAction={onFixAction}
+                fixingActionId={fixingActionId}
+              />
             </div>
           </section>
         ) : null}

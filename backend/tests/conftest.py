@@ -13,7 +13,7 @@ def client() -> TestClient:
     return TestClient(app)
 
 
-def svg_document(body: str, *, width: str = "12in", height: str = "8in", viewbox: str = "0 0 1152 768") -> bytes:
+def svg_document(body: str, *, width: str = "12in", height: str = "12in", viewbox: str = "0 0 1152 1152") -> bytes:
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="{viewbox}">{body}</svg>'

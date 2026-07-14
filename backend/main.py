@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .models import AnalysisReport
 from .profile import get_assignment, get_material, load_profile, public_profile
-from .svg_analyzer import SVGAnalysisError, analyze_svg, failure_report
+from .svg_analyzer import SVGAnalysisError, analyze_svg, failure_report, fix_strokes
 
 
 logger = logging.getLogger("laser_reviewer")
@@ -48,7 +49,7 @@ class AggregateRequestLimitMiddleware:
         if not (
             scope["type"] == "http"
             and scope.get("method") == "POST"
-            and scope.get("path") == "/api/v1/analyze"
+            and scope.get("path") in {"/api/v1/analyze", "/api/v1/fix-strokes"}
         ):
             await self.app(scope, receive, send)
             return
@@ -107,7 +108,7 @@ class AggregateRequestLimitMiddleware:
 
 app = FastAPI(
     title="Laser Cutter Reviewer API",
-    version="1.0.0",
+    version="1.1.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
@@ -128,6 +129,21 @@ def _release_analysis_permit(task: asyncio.Task) -> None:
     except BaseException:
         pass
     ANALYSIS_SEMAPHORE.release()
+
+
+async def _read_svg_upload(file: UploadFile, max_bytes: int) -> tuple[bytes, str]:
+    filename = file.filename or "upload.svg"
+    try:
+        data = await file.read(max_bytes + 1)
+    finally:
+        await file.close()
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=413, detail="SVG exceeds the 20 MB upload limit")
+    if not data:
+        raise HTTPException(status_code=422, detail="The uploaded file is empty")
+    if Path(filename).suffix.lower() != ".svg":
+        raise HTTPException(status_code=415, detail="Only .svg files are supported in v1")
+    return data, filename
 
 
 @app.middleware("http")
@@ -181,22 +197,12 @@ async def analyze_endpoint(
     if not material.approved:
         raise HTTPException(status_code=422, detail=f"Material is not approved for student use: {material.name}")
     if not any(abs(thickness_mm - choice) <= 0.001 for choice in material.thicknesses_mm):
-        choices = ", ".join(str(value) for value in material.thicknesses_mm)
+        choices = ", ".join(f"{value / 25.4:.4f} in" for value in material.thicknesses_mm)
         raise HTTPException(
             status_code=422,
-            detail=f"Unsupported thickness for {material.name}; choose one of: {choices} mm",
+            detail=f"Unsupported thickness for {material.name}; choose one of: {choices}",
         )
-    filename = file.filename or "upload.svg"
-    try:
-        data = await file.read(profile.limits.max_upload_bytes + 1)
-    finally:
-        await file.close()
-    if len(data) > profile.limits.max_upload_bytes:
-        raise HTTPException(status_code=413, detail="SVG exceeds the 20 MB upload limit")
-    if not data:
-        raise HTTPException(status_code=422, detail="The uploaded file is empty")
-    if Path(filename).suffix.lower() != ".svg":
-        raise HTTPException(status_code=415, detail="Only .svg files are supported in v1")
+    data, filename = await _read_svg_upload(file, profile.limits.max_upload_bytes)
 
     try:
         await asyncio.wait_for(ANALYSIS_SEMAPHORE.acquire(), timeout=2.0)
@@ -254,6 +260,74 @@ async def analyze_endpoint(
     finally:
         if release_on_exit:
             ANALYSIS_SEMAPHORE.release()
+
+
+@app.post("/api/v1/fix-strokes", tags=["preflight"])
+async def fix_strokes_endpoint(
+    file: Annotated[UploadFile, File(description="The same SVG that was analyzed")],
+    assignment_id: Annotated[str, Form()],
+    expected_sha256: Annotated[str, Form()],
+) -> Response:
+    profile = load_profile()
+    try:
+        assignment = get_assignment(profile, assignment_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=422, detail=f"Unknown assignment_id: {assignment_id}") from exc
+    data, filename = await _read_svg_upload(file, profile.limits.max_upload_bytes)
+    expected_sha256 = expected_sha256.strip().lower()
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise HTTPException(
+            status_code=409,
+            detail="This SVG no longer matches the analyzed file. Analyze it again before fixing strokes.",
+        )
+
+    try:
+        await asyncio.wait_for(ANALYSIS_SEMAPHORE.acquire(), timeout=2.0)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=503, detail="Analyzer is busy; try again shortly") from exc
+    release_on_exit = True
+    try:
+        fix_task = asyncio.create_task(
+            asyncio.to_thread(
+                fix_strokes,
+                data=data,
+                expected_sha256=expected_sha256,
+                profile=profile,
+                assignment=assignment,
+            )
+        )
+        try:
+            fixed = await asyncio.wait_for(
+                asyncio.shield(fix_task),
+                timeout=profile.limits.analysis_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            release_on_exit = False
+            fix_task.add_done_callback(_release_analysis_permit)
+            raise HTTPException(status_code=504, detail="Stroke correction exceeded the analysis time limit") from exc
+        except asyncio.CancelledError:
+            release_on_exit = False
+            fix_task.add_done_callback(_release_analysis_permit)
+            raise
+    finally:
+        if release_on_exit:
+            ANALYSIS_SEMAPHORE.release()
+
+    safe_stem = "".join(
+        character for character in Path(filename).stem
+        if character.isascii() and (character.isalnum() or character in {"-", "_"})
+    )[:120] or "laser-file"
+    fixed_sha256 = hashlib.sha256(fixed.data).hexdigest()
+    return Response(
+        content=fixed.data,
+        media_type="image/svg+xml",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_stem}-cut-strokes-fixed.svg"',
+            "X-Original-SHA256": expected_sha256.lower(),
+            "X-Fixed-SHA256": fixed_sha256,
+            "X-Corrected-Stroke-Count": str(len(fixed.changed_source_ids)),
+        },
+    )
 
 
 def _configure_frontend() -> None:
