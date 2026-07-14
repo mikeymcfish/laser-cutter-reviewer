@@ -6,7 +6,7 @@ colorTo: indigo
 sdk: docker
 app_port: 7860
 pinned: false
-short_description: Student-facing SVG preflight for Epilog laser cutter projects
+short_description: Student SVG preflight for Epilog laser cutter projects
 ---
 
 # Laser Cutter Reviewer
