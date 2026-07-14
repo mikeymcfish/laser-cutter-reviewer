@@ -1,0 +1,15 @@
+services:
+  reviewer:
+    build:
+      context: .
+    image: laser-cutter-reviewer:local
+    ports:
+      - "7860:7860"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped

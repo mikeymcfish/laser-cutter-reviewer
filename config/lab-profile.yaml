@@ -1,0 +1,110 @@
+profile:
+  id: epilog-classroom-demo
+  name: Epilog Classroom Demo
+  version: 1.0.0
+  demo: true
+
+machine:
+  label: Epilog laser cutter (demo profile)
+  bed_width_mm: 812.8
+  bed_height_mm: 508.0
+  margin_mm: 6.35
+  vector_hairline_threshold_mm: 0.0254
+
+limits:
+  max_upload_bytes: 20971520
+  max_elements: 10000
+  max_path_segments: 20000
+  max_xml_depth: 64
+  max_preview_points: 30000
+  analysis_timeout_seconds: 15
+
+assignments:
+  - id: intro-svg
+    name: Intro laser-cutting project
+    description: A 12 x 8 inch Illustrator artboard with black through-cut vectors.
+    page_policy: exact
+    expected_width_mm: 304.8
+    expected_height_mm: 203.2
+    page_tolerance_mm: 0.25
+    image_policy: warning
+    min_raster_dpi: 300
+    severity_overrides: {}
+    processes:
+      - id: cut
+        name: Through cut
+        color: "#000000"
+        stroke_width_mm: 0.0254
+        stroke_tolerance_mm: 0.0005
+        require_closed: true
+  - id: vector-trace
+    name: Vector tracing exercise
+    description: Same cut setup, with raster images prohibited in the submitted artwork.
+    page_policy: exact
+    expected_width_mm: 304.8
+    expected_height_mm: 203.2
+    page_tolerance_mm: 0.25
+    image_policy: blocker
+    min_raster_dpi: 300
+    severity_overrides: {}
+    processes:
+      - id: cut
+        name: Through cut
+        color: "#000000"
+        stroke_width_mm: 0.0254
+        stroke_tolerance_mm: 0.0005
+        require_closed: true
+  - id: open-studio
+    name: Open studio
+    description: Any document that fits the usable bed; raster images are allowed with a warning.
+    page_policy: fit_bed
+    page_tolerance_mm: 0.25
+    image_policy: warning
+    min_raster_dpi: 300
+    severity_overrides: {}
+    processes:
+      - id: cut
+        name: Through cut
+        color: "#000000"
+        stroke_width_mm: 0.0254
+        stroke_tolerance_mm: 0.0005
+        require_closed: true
+
+materials:
+  - id: birch-plywood
+    name: Baltic birch plywood
+    family: wood
+    approved: true
+    thicknesses_mm: [3.0, 6.0]
+    kerf_mm: 0.18
+    min_bridge_mm: 1.5
+    min_spacing_mm: 0.6
+    min_piece_area_mm2: 16.0
+    heat_density_threshold_mm_per_mm2: 0.25
+    severity_overrides: {}
+    preview:
+      color: "#c89f69"
+      opacity: 1.0
+      roughness: 0.82
+  - id: cast-acrylic
+    name: Cast acrylic
+    family: acrylic
+    approved: true
+    thicknesses_mm: [3.0, 6.0]
+    kerf_mm: 0.15
+    min_bridge_mm: 1.2
+    min_spacing_mm: 0.5
+    min_piece_area_mm2: 12.0
+    heat_density_threshold_mm_per_mm2: 0.25
+    severity_overrides: {}
+    preview:
+      color: "#79bfe8"
+      opacity: 0.56
+      roughness: 0.18
+
+operator_checklist:
+  - Confirm the material and its SDS are approved for this laser.
+  - Confirm speed, power, frequency, and process mapping with the instructor.
+  - Focus the laser and verify the job origin and material placement.
+  - Turn on exhaust and Air Assist before starting.
+  - Stay with the laser for the entire job and know how to stop it.
