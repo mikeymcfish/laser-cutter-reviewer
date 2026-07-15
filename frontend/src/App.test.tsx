@@ -58,6 +58,10 @@ const report: AnalysisReport = {
       fix: 'Use Object > Path > Join to close the two endpoints.',
       object_ids: ['path-open'],
       bounds: [{ x_mm: 15, y_mm: 10, width_mm: 30, height_mm: 25 }],
+      markers: [
+        { id: 'open-endpoint-0001', kind: 'open_endpoint', label: 'Open endpoint 1', object_ids: ['path-open'], location_mm: [15, 10] },
+        { id: 'open-endpoint-0002', kind: 'open_endpoint', label: 'Open endpoint 2', object_ids: ['path-open'], location_mm: [45, 35] },
+      ],
     },
     {
       rule_id: 'images.none',
@@ -130,6 +134,8 @@ describe('Laser Ready app', () => {
     await user.click(screen.getByRole('button', { name: /Cut lines are closed/ }))
     expect(screen.getByText('Gap: 0.016 in')).toBeInTheDocument()
     expect(screen.getByText(/Object > Path > Join/)).toBeInTheDocument()
+    expect(container.querySelectorAll('[data-finding-marker-kind="open_endpoint"]')).toHaveLength(2)
+    expect(screen.getByRole('img', { name: /2 localized finding markers circled/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /3D material/ })).toBeDisabled()
     expect(screen.getByText(/Open cut lines must be fixed/)).toBeInTheDocument()
   })

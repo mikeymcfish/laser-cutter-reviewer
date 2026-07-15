@@ -52,4 +52,18 @@ describe('UploadPanel', () => {
     expect(screen.getByText('selected.svg')).toBeInTheDocument()
     expect(document.querySelector<HTMLInputElement>('input[type="file"]')).toBeDisabled()
   })
+
+  it('clears the native input so the same SVG can be chosen again', () => {
+    const onFileChange = vi.fn()
+    render(<UploadPanel {...baseProps} onFileChange={onFileChange} />)
+    const input = document.querySelector<HTMLInputElement>('input[type="file"]')!
+    const selected = new File(['<svg/>'], 'again.svg', { type: 'image/svg+xml' })
+
+    fireEvent.change(input, { target: { files: [selected] } })
+    expect(onFileChange).toHaveBeenCalledWith(selected)
+    expect(input.value).toBe('')
+
+    fireEvent.change(input, { target: { files: [selected] } })
+    expect(onFileChange).toHaveBeenCalledTimes(2)
+  })
 })

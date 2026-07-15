@@ -3,11 +3,19 @@ from __future__ import annotations
 import base64
 import io
 import math
+from pathlib import Path
 
 import pytest
 from PIL import Image
 
 from .conftest import check, post_svg, svg_document
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def fixture_svg(name: str) -> bytes:
+    return (FIXTURES / name).read_bytes()
 
 
 @pytest.mark.parametrize("stroke", ["0.001in", "0.072pt", "0.025mm", "0.0254mm", "0.096px"])
@@ -161,6 +169,67 @@ def test_partial_coincident_overlap_blocks_but_point_crossing_warns(client):
     crossing_report = post_svg(client, crossing).json()
     assert check(crossing_report, "geometry.topology")["state"] == "pass"
     assert check(crossing_report, "geometry.crossings")["state"] == "warning"
+
+
+def test_open_cut_fixture_localizes_every_unconnected_endpoint(client):
+    report = post_svg(client, fixture_svg("open-unconnected.svg")).json()
+    closed = check(report, "geometry.closed_cuts")
+
+    assert closed["state"] == "blocker"
+    assert closed["object_ids"] == ["open-cut", "loose-line"]
+    assert [marker["kind"] for marker in closed["markers"]] == ["open_endpoint"] * 4
+    assert [marker["location_mm"] for marker in closed["markers"]] == [
+        [25.4, 25.4],
+        [76.2, 76.2],
+        [101.6, 101.6],
+        [127.0, 127.0],
+    ]
+
+
+def test_crossing_fixture_localizes_each_ordinary_intersection(client):
+    report = post_svg(client, fixture_svg("crossing-cuts.svg")).json()
+    crossings = check(report, "geometry.crossings")
+
+    assert check(report, "geometry.topology")["state"] == "pass"
+    assert crossings["state"] == "warning"
+    assert {tuple(marker["location_mm"]) for marker in crossings["markers"]} == {
+        (50.8, 76.2),
+        (76.2, 50.8),
+    }
+    assert all(
+        marker["kind"] == "intersection"
+        and set(marker["object_ids"]) == {"upper-left", "lower-right"}
+        for marker in crossings["markers"]
+    )
+
+
+def test_coincident_overlap_fixture_blocks_without_mislabeling_crossings(client):
+    report = post_svg(client, fixture_svg("partial-overlap.svg")).json()
+    topology = check(report, "geometry.topology")
+
+    assert topology["state"] == "blocker"
+    assert {tuple(marker["location_mm"]) for marker in topology["markers"]} == {
+        (50.8, 25.4),
+        (76.2, 25.4),
+    }
+    assert all(marker["kind"] == "overlap_endpoint" for marker in topology["markers"])
+    assert check(report, "geometry.crossings")["state"] == "pass"
+    assert check(report, "geometry.crossings")["markers"] == []
+
+
+def test_self_intersection_fixture_localizes_the_crossing(client):
+    report = post_svg(client, fixture_svg("self-intersection.svg")).json()
+    topology = check(report, "geometry.topology")
+
+    assert topology["state"] == "blocker"
+    assert topology["object_ids"] == ["bowtie"]
+    assert topology["markers"] == [{
+        "id": "self-intersection-0001",
+        "kind": "self_intersection",
+        "label": "Self-intersection on bowtie",
+        "object_ids": ["bowtie"],
+        "location_mm": [50.8, 50.8],
+    }]
 
 
 def test_live_text_blocks_and_outlined_text_does_not(client):

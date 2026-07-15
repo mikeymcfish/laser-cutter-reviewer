@@ -1,7 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
-import type { Point, PreviewGeometry, PreviewRasterAsset, PreviewRasterLayer, PreviewWeakPoint } from '../types'
+import type {
+  AnalysisCheck,
+  Point,
+  PreviewGeometry,
+  PreviewPiece,
+  PreviewRasterAsset,
+  PreviewRasterLayer,
+  PreviewWeakPoint,
+} from '../types'
 import { rasterPlacement as calculateRasterPlacement } from '../rasterPlacement'
 import { formatInches } from '../units'
 
@@ -16,6 +24,7 @@ interface Preview3DProps {
     roughness?: number
   }
   showWeakPoints?: boolean
+  selectedCheck?: AnalysisCheck
 }
 
 const bounds = (points: Point[]) => {
@@ -141,6 +150,35 @@ const intersects = (left: ReturnType<typeof bounds>, right: ReturnType<typeof bo
   && left.minY <= right.maxY
 )
 
+const pointOnSegment = (point: Point, start: Point, end: Point) => {
+  const cross = (point[0] - start[0]) * (end[1] - start[1]) - (point[1] - start[1]) * (end[0] - start[0])
+  if (Math.abs(cross) > 1e-7) return false
+  return point[0] >= Math.min(start[0], end[0]) - 1e-7
+    && point[0] <= Math.max(start[0], end[0]) + 1e-7
+    && point[1] >= Math.min(start[1], end[1]) - 1e-7
+    && point[1] <= Math.max(start[1], end[1]) + 1e-7
+}
+
+const pointInLoop = (point: Point, loop: Point[]) => {
+  if (loop.length < 3) return false
+  let inside = false
+  for (let index = 0, previous = loop.length - 1; index < loop.length; previous = index++) {
+    const start = loop[previous]
+    const end = loop[index]
+    if (pointOnSegment(point, start, end)) return true
+    if (
+      (start[1] > point[1]) !== (end[1] > point[1])
+      && point[0] < ((end[0] - start[0]) * (point[1] - start[1])) / (end[1] - start[1]) + start[0]
+    ) inside = !inside
+  }
+  return inside
+}
+
+const pieceContainsPoint = (piece: PreviewPiece, point: Point) => (
+  pointInLoop(point, piece.outer)
+  && !(piece.holes ?? []).some((hole) => pointInLoop(point, hole))
+)
+
 const layerRenderOrder = (zIndex: number, sequence: number) => (
   1_000 + Math.max(0, Number.isFinite(zIndex) ? zIndex : sequence) + sequence * 1e-6
 )
@@ -184,8 +222,21 @@ const disposeObject = (
   materials.forEach((material) => material.dispose())
 }
 
-export function Preview3D({ geometry, materialType, thicknessMm, kerfMm, previewAppearance, showWeakPoints = false }: Preview3DProps) {
+export function Preview3D({
+  geometry,
+  materialType,
+  thicknessMm,
+  kerfMm,
+  previewAppearance,
+  showWeakPoints = false,
+  selectedCheck,
+}: Preview3DProps) {
   const hostRef = useRef<HTMLDivElement>(null)
+  const viewStateRef = useRef<{
+    geometry: PreviewGeometry
+    camera: [number, number, number]
+    target: [number, number, number]
+  } | null>(null)
   const [exploded, setExploded] = useState(false)
   const [showSheetReference, setShowSheetReference] = useState(true)
   const [renderError, setRenderError] = useState('')
@@ -204,6 +255,7 @@ export function Preview3D({ geometry, materialType, thicknessMm, kerfMm, preview
   useEffect(() => {
     const host = hostRef.current
     if (!host || !geometry.valid_3d) return
+    setRenderError('')
     let animationFrame = 0
     let renderer: THREE.WebGLRenderer | undefined
     let controls: OrbitControls | undefined
@@ -218,12 +270,12 @@ export function Preview3D({ geometry, materialType, thicknessMm, kerfMm, preview
       const pageHeight = Number(geometry.page.height_mm) || 1
       const width = Math.max(host.clientWidth, 300)
       const height = Math.max(host.clientHeight, 360)
+      const maxDimension = Math.max(pageWidth, pageHeight, 50)
       const scene = new THREE.Scene()
       scene.background = new THREE.Color('#edf0f4')
-      scene.fog = new THREE.Fog('#edf0f4', Math.max(pageWidth, pageHeight) * 1.5, Math.max(pageWidth, pageHeight) * 4)
+      scene.fog = new THREE.Fog('#edf0f4', maxDimension * 1.5, maxDimension * 4)
 
       const camera = new THREE.PerspectiveCamera(36, width / height, 0.1, 5000)
-      const maxDimension = Math.max(pageWidth, pageHeight, 50)
       camera.position.set(maxDimension * 0.72, -maxDimension * 0.92, maxDimension * 0.95)
 
       renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' })
@@ -237,7 +289,13 @@ export function Preview3D({ geometry, materialType, thicknessMm, kerfMm, preview
       controls = new OrbitControls(camera, renderer.domElement)
       controls.enableDamping = true
       controls.dampingFactor = 0.06
-      controls.target.set(0, 0, 0)
+      const savedView = viewStateRef.current
+      if (savedView?.geometry === geometry) {
+        camera.position.set(...savedView.camera)
+        controls.target.set(...savedView.target)
+      } else {
+        controls.target.set(0, 0, 0)
+      }
       controls.minDistance = maxDimension * 0.35
       controls.maxDistance = maxDimension * 4
 
@@ -256,6 +314,21 @@ export function Preview3D({ geometry, materialType, thicknessMm, kerfMm, preview
       const surfaceOverlayGap = 0.04
       const centerX = pageWidth / 2
       const centerY = pageHeight / 2
+      const pieceTransforms = geometry.pieces.map((piece, index) => {
+        const position = new THREE.Vector3()
+        if (effectiveExploded) {
+          const pieceBounds = bounds(piece.outer)
+          const pieceX = (pieceBounds.minX + pieceBounds.maxX) / 2 - centerX
+          const pieceY = centerY - (pieceBounds.minY + pieceBounds.maxY) / 2
+          const length = Math.hypot(pieceX, pieceY) || 1
+          const spread = maxDimension * (0.045 + (index % 3) * 0.009)
+          position.set((pieceX / length) * spread, (pieceY / length) * spread, index * thickness * 0.12)
+        }
+        return { piece, position }
+      })
+      const transformForPoint = (point: Point) => (
+        pieceTransforms.find(({ piece }) => pieceContainsPoint(piece, point))?.position
+      )
       const rasterLayers = renderableRasterLayers(geometry)
       const textureLoader = new THREE.TextureLoader()
       const rasterSurfaces: RasterSurfaceLayer[] = rasterLayers.map((item, order) => {
@@ -349,7 +422,8 @@ export function Preview3D({ geometry, materialType, thicknessMm, kerfMm, preview
       })
 
       if (showSheetReference) {
-        const offcutGeometry = new THREE.BoxGeometry(pageWidth, pageHeight, Math.max(thickness * 0.12, 0.35))
+        const sheetDepth = Math.max(thickness * 0.12, 0.35)
+        const offcutGeometry = new THREE.BoxGeometry(pageWidth, pageHeight, sheetDepth)
         const offcutMaterial = new THREE.MeshStandardMaterial({
           color: previewColor,
           roughness: previewRoughness,
@@ -361,6 +435,19 @@ export function Preview3D({ geometry, materialType, thicknessMm, kerfMm, preview
         offcut.position.z = -Math.max(thickness * 0.22, 0.5)
         offcut.receiveShadow = true
         sceneObjects.add(offcut)
+
+        const referenceSurfaceZ = offcut.position.z + sheetDepth / 2 + surfaceOverlayGap
+        rasterSurfaces.forEach((raster) => {
+          const imageSurface = new THREE.Mesh(
+            new THREE.PlaneGeometry(pageWidth, pageHeight),
+            raster.material,
+          )
+          imageSurface.position.z = referenceSurfaceZ + raster.order * 0.002
+          imageSurface.renderOrder = layerRenderOrder(raster.layer.z_index, raster.sequence)
+          imageSurface.userData.previewRasterLayerId = raster.layer.id
+          imageSurface.userData.previewRasterSurface = 'sheet-reference'
+          sceneObjects.add(imageSurface)
+        })
       }
 
       geometry.pieces.forEach((piece, index) => {
@@ -407,14 +494,8 @@ export function Preview3D({ geometry, materialType, thicknessMm, kerfMm, preview
         const mesh = new THREE.Mesh(extrude, surface)
         mesh.castShadow = true
         mesh.receiveShadow = true
-        if (effectiveExploded) {
-          const pieceBounds = bounds(piece.outer)
-          const pieceX = (pieceBounds.minX + pieceBounds.maxX) / 2 - centerX
-          const pieceY = centerY - (pieceBounds.minY + pieceBounds.maxY) / 2
-          const length = Math.hypot(pieceX, pieceY) || 1
-          const spread = maxDimension * (0.045 + (index % 3) * 0.009)
-          mesh.position.set((pieceX / length) * spread, (pieceY / length) * spread, index * thickness * 0.12)
-        }
+        mesh.position.copy(pieceTransforms[index].position)
+        mesh.userData.previewPieceId = piece.id
         sceneObjects.add(mesh)
 
         const edges = new THREE.LineSegments(
@@ -461,8 +542,79 @@ export function Preview3D({ geometry, materialType, thicknessMm, kerfMm, preview
             new THREE.LineBasicMaterial({ color: isAcrylic ? '#215d70' : '#744129', transparent: true, opacity: 0.78 }),
           )
           line.renderOrder = layerRenderOrder(path.z_index, index)
+          const pathPoint = path.points.find((point) => transformForPoint(point)) ?? path.points[0]
+          const pieceTransform = transformForPoint(pathPoint)
+          if (pieceTransform) line.position.copy(pieceTransform)
+          line.userData.previewPathId = path.id
           sceneObjects.add(line)
         })
+
+      const selectedObjectIds = new Set(selectedCheck?.object_ids ?? [])
+      geometry.paths
+        .filter((path) => selectedObjectIds.has(path.id) && path.points.length >= 2)
+        .forEach((path) => {
+          const lineZ = topSurfaceZ + surfaceOverlayGap + rasterSurfaces.length * 0.002 + 0.025
+          const points = path.points.map(([x, y]) => new THREE.Vector3(x - centerX, pageHeight - y - centerY, lineZ))
+          if (path.closed) points.push(points[0].clone())
+          const line = new THREE.Line(
+            new THREE.BufferGeometry().setFromPoints(points),
+            new THREE.LineBasicMaterial({
+              color: '#2d5bdb',
+              transparent: true,
+              opacity: 1,
+              depthTest: false,
+              depthWrite: false,
+            }),
+          )
+          const pathPoint = path.points.find((point) => transformForPoint(point)) ?? path.points[0]
+          const pieceTransform = transformForPoint(pathPoint)
+          if (pieceTransform) line.position.copy(pieceTransform)
+          line.renderOrder = 21_000
+          line.userData.previewSelectedPathId = path.id
+          sceneObjects.add(line)
+        })
+
+      const explicitFindingMarkers = (selectedCheck?.markers ?? []).filter((marker) => finitePoint(marker.location_mm))
+      const findingMarkers = explicitFindingMarkers.length
+        ? explicitFindingMarkers
+        : geometry.paths
+            .filter((path) => selectedObjectIds.has(path.id) && finitePoint(path.points[0]))
+            .map((path) => ({
+              id: `selected-${path.id}`,
+              kind: 'object' as const,
+              label: path.id,
+              object_ids: [path.id],
+              location_mm: path.points[0],
+            }))
+      if (findingMarkers.length) {
+        const markerRadius = Math.max(0.8, Math.min(2.2, maxDimension * 0.007))
+        findingMarkers.forEach((finding, index) => {
+          const texture = numberedMarkerTexture(index + 1, '#2d5bdb')
+          const marker = texture
+            ? new THREE.Sprite(new THREE.SpriteMaterial({
+                map: texture,
+                transparent: true,
+                depthTest: false,
+                depthWrite: false,
+                toneMapped: false,
+              }))
+            : new THREE.Mesh(
+                new THREE.CircleGeometry(markerRadius, 28),
+                new THREE.MeshBasicMaterial({ color: '#2d5bdb', depthTest: false, depthWrite: false }),
+              )
+          const pieceTransform = transformForPoint(finding.location_mm)
+          marker.position.set(
+            finding.location_mm[0] - centerX + (pieceTransform?.x ?? 0),
+            pageHeight - finding.location_mm[1] - centerY + (pieceTransform?.y ?? 0),
+            topSurfaceZ + 0.28 + (pieceTransform?.z ?? 0),
+          )
+          if (marker instanceof THREE.Sprite) marker.scale.setScalar(markerRadius * 3.4)
+          marker.renderOrder = 22_000
+          marker.userData.previewFindingMarkerId = finding.id
+          marker.userData.previewFindingMarkerKind = finding.kind
+          sceneObjects.add(marker)
+        })
+      }
 
       if (showWeakPoints) {
         const markerRadius = Math.max(0.8, Math.min(2.2, maxDimension * 0.007))
@@ -565,6 +717,11 @@ export function Preview3D({ geometry, materialType, thicknessMm, kerfMm, preview
 
       return () => {
         resourcesActive = false
+        viewStateRef.current = {
+          geometry,
+          camera: [camera.position.x, camera.position.y, camera.position.z],
+          target: [controls?.target.x ?? 0, controls?.target.y ?? 0, controls?.target.z ?? 0],
+        }
         cancelAnimationFrame(animationFrame)
         resizeObserver?.disconnect()
         controls?.dispose()
@@ -582,7 +739,7 @@ export function Preview3D({ geometry, materialType, thicknessMm, kerfMm, preview
       renderer?.dispose()
       renderer?.domElement.remove()
     }
-  }, [effectiveExploded, geometry, isAcrylic, kerfMm, previewColor, previewOpacity, previewRoughness, showSheetReference, showWeakPoints, thicknessMm, weakPoints])
+  }, [effectiveExploded, geometry, isAcrylic, kerfMm, previewColor, previewOpacity, previewRoughness, selectedCheck, showSheetReference, showWeakPoints, thicknessMm, weakPoints])
 
   if (!geometry.valid_3d) {
     return (
@@ -607,12 +764,14 @@ export function Preview3D({ geometry, materialType, thicknessMm, kerfMm, preview
           Show sheet reference
         </label>
       </div>
-      {renderError ? <div className="preview-unavailable"><p>{renderError}</p></div> : null}
+      {renderError ? <div className="preview-unavailable" role="status"><p>{renderError}</p></div> : null}
       <div
         className="three-host"
         ref={hostRef}
+        hidden={Boolean(renderError)}
+        aria-hidden={renderError ? 'true' : undefined}
         role="img"
-        aria-label={`Approximate three-dimensional ${isAcrylic ? 'acrylic' : 'wood'} cut preview${rasterLayerCount ? ` with ${rasterLayerCount} embedded image ${rasterLayerCount === 1 ? 'layer' : 'layers'} on the piece surfaces` : ''}${showWeakPoints && weakPoints.length ? ` and ${weakPoints.length} potential weak ${weakPoints.length === 1 ? 'point' : 'points'} highlighted` : ''}. Drag to orbit and scroll to zoom.`}
+        aria-label={`Approximate three-dimensional ${isAcrylic ? 'acrylic' : 'wood'} cut preview${rasterLayerCount ? ` with ${rasterLayerCount} embedded image ${rasterLayerCount === 1 ? 'layer' : 'layers'} on material surfaces` : ''}${showWeakPoints && weakPoints.length ? ` and ${weakPoints.length} potential weak ${weakPoints.length === 1 ? 'point' : 'points'} highlighted` : ''}. Drag to orbit and scroll to zoom.`}
       />
       <p className="preview-hint">
         Drag to orbit · Scroll to zoom · Approximate {formatInches(kerfMm)} kerf
@@ -620,7 +779,7 @@ export function Preview3D({ geometry, materialType, thicknessMm, kerfMm, preview
       </p>
       {rasterLayerCount ? (
         <p className="preview-hint">
-          {rasterLayerCount === 1 ? 'Embedded image is' : 'Embedded images are'} shown as multiply layers on piece tops.
+          {rasterLayerCount === 1 ? 'Embedded image is' : 'Embedded images are'} shown as multiply layers on material surfaces and the optional sheet reference.
         </p>
       ) : null}
       {showWeakPoints ? (

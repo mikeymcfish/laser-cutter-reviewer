@@ -224,6 +224,21 @@ class Bounds(StrictModel):
     height_mm: float = Field(ge=0)
 
 
+class FindingMarker(StrictModel):
+    id: str
+    kind: Literal["open_endpoint", "intersection", "self_intersection", "overlap_endpoint"]
+    label: str
+    object_ids: list[str] = Field(min_length=1, max_length=2)
+    location_mm: tuple[FiniteFloat, FiniteFloat]
+
+    @model_validator(mode="after")
+    def validate_object_count(self) -> "FindingMarker":
+        expected = 1 if self.kind in {"open_endpoint", "self_intersection"} else 2
+        if len(self.object_ids) != expected:
+            raise ValueError(f"{self.kind} markers require {expected} affected object(s)")
+        return self
+
+
 class CheckResult(StrictModel):
     rule_id: str
     title: str
@@ -233,6 +248,7 @@ class CheckResult(StrictModel):
     fix: str | None = None
     object_ids: list[str] = Field(default_factory=list)
     bounds: list[Bounds] = Field(default_factory=list)
+    markers: list[FindingMarker] = Field(default_factory=list, max_length=400)
     fix_actions: list["FixAction"] = Field(default_factory=list)
 
 
@@ -381,8 +397,8 @@ class PreviewWeakPoint(StrictModel):
             raise ValueError("linear weak points require a two-point millimeter span")
         if self.kind == "close_cut_spacing" and len(self.object_ids) != 2:
             raise ValueError("close-cut weak points require two affected objects")
-        if self.kind != "close_cut_spacing" and len(self.object_ids) != 1:
-            raise ValueError("single-object weak points require one affected object")
+        if self.kind == "tiny_piece" and len(self.object_ids) != 1:
+            raise ValueError("tiny-piece weak points require one affected object")
         return self
 
 

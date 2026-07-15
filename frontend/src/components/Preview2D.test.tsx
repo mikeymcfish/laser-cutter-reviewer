@@ -75,6 +75,109 @@ describe('Preview2D', () => {
     expect(container.querySelector('foreignObject')).toBeNull()
   })
 
+  it('circles each localized open endpoint instead of marking an arbitrary path vertex', () => {
+    const { container } = render(
+      <Preview2D
+        geometry={{
+          page: { width_mm: 100, height_mm: 50 },
+          paths: [
+            { id: 'open-cut', z_index: 0, operation: 'cut', closed: false, points: [[10, 10], [40, 10], [40, 30]] },
+          ],
+          pieces: [],
+          valid_3d: false,
+        }}
+        selectedCheck={{
+          rule_id: 'geometry.closed_cuts',
+          title: 'Through-cut paths are closed',
+          state: 'blocker',
+          object_ids: ['open-cut'],
+          markers: [
+            { id: 'open-endpoint-0001', kind: 'open_endpoint', label: 'Open endpoint 1', object_ids: ['open-cut'], location_mm: [10, 10] },
+            { id: 'open-endpoint-0002', kind: 'open_endpoint', label: 'Open endpoint 2', object_ids: ['open-cut'], location_mm: [40, 30] },
+          ],
+        }}
+      />,
+    )
+
+    expect(screen.getByRole('img', { name: /2 localized finding markers circled/ })).toBeInTheDocument()
+    const markers = container.querySelectorAll('[data-finding-marker]')
+    expect(markers).toHaveLength(2)
+    expect(markers[0]).toHaveAttribute('transform', 'translate(10 10)')
+    expect(markers[1]).toHaveAttribute('transform', 'translate(40 30)')
+    expect(markers[0]).toHaveAttribute('data-finding-marker-kind', 'open_endpoint')
+    expect(container.querySelector('[data-finding-marker] title')?.textContent).toBe('Open endpoint 1')
+    expect(screen.getByText('Circled problem location')).toBeInTheDocument()
+  })
+
+  it('circles ordinary crossing locations and ignores non-finite marker coordinates', () => {
+    const { container } = render(
+      <Preview2D
+        geometry={{
+          page: { width_mm: 100, height_mm: 100 },
+          paths: [
+            { id: 'a', z_index: 0, operation: 'cut', closed: true, points: [[10, 10], [50, 10], [50, 50], [10, 50]] },
+            { id: 'b', z_index: 1, operation: 'cut', closed: true, points: [[30, 30], [70, 30], [70, 70], [30, 70]] },
+          ],
+          pieces: [],
+          valid_3d: true,
+        }}
+        selectedCheck={{
+          rule_id: 'geometry.crossings',
+          title: 'Cut crossings and touches',
+          state: 'warning',
+          object_ids: ['a', 'b'],
+          markers: [
+            { id: 'intersection-0001', kind: 'intersection', label: 'Crossing one', object_ids: ['a', 'b'], location_mm: [30, 50] },
+            { id: 'intersection-0002', kind: 'intersection', label: 'Crossing two', object_ids: ['a', 'b'], location_mm: [50, 30] },
+            { id: 'unsafe', kind: 'intersection', label: 'Unsafe marker', object_ids: ['a', 'b'], location_mm: [Number.NaN, 10] },
+          ],
+        }}
+      />,
+    )
+
+    const markers = container.querySelectorAll('[data-finding-marker-kind="intersection"]')
+    expect(markers).toHaveLength(2)
+    expect([...markers].map((marker) => marker.getAttribute('transform'))).toEqual([
+      'translate(30 50)',
+      'translate(50 30)',
+    ])
+    expect(container.querySelector('[data-finding-marker="unsafe"]')).toBeNull()
+  })
+
+  it('circles self-intersections and coincident-overlap endpoints for topology blockers', () => {
+    const { container } = render(
+      <Preview2D
+        geometry={{
+          page: { width_mm: 100, height_mm: 100 },
+          paths: [
+            { id: 'bowtie', z_index: 0, operation: 'cut', closed: true, points: [[10, 10], [50, 50], [10, 50], [50, 10]] },
+            { id: 'left', z_index: 1, operation: 'cut', closed: true, points: [[55, 10], [85, 10], [85, 40], [55, 40]] },
+            { id: 'right', z_index: 2, operation: 'cut', closed: true, points: [[70, 10], [95, 10], [95, 30], [70, 30]] },
+          ],
+          pieces: [],
+          valid_3d: false,
+        }}
+        selectedCheck={{
+          rule_id: 'geometry.topology',
+          title: 'Cut topology is valid',
+          state: 'blocker',
+          object_ids: ['bowtie', 'left', 'right'],
+          markers: [
+            { id: 'self-intersection-0001', kind: 'self_intersection', label: 'Self-intersection on bowtie', object_ids: ['bowtie'], location_mm: [30, 30] },
+            { id: 'overlap-endpoint-0001', kind: 'overlap_endpoint', label: 'Coincident overlap endpoint', object_ids: ['left', 'right'], location_mm: [70, 10] },
+            { id: 'overlap-endpoint-0002', kind: 'overlap_endpoint', label: 'Coincident overlap endpoint', object_ids: ['left', 'right'], location_mm: [85, 10] },
+          ],
+        }}
+      />,
+    )
+
+    expect(container.querySelectorAll('[data-finding-marker-kind="self_intersection"]')).toHaveLength(1)
+    expect(container.querySelectorAll('[data-finding-marker-kind="overlap_endpoint"]')).toHaveLength(2)
+    expect(container.querySelector('[data-finding-marker="self-intersection-0001"]')).toHaveAttribute('transform', 'translate(30 30)')
+    expect(container.querySelector('[data-finding-marker="overlap-endpoint-0002"]')).toHaveAttribute('transform', 'translate(85 10)')
+    expect(screen.getByRole('img', { name: /3 localized finding markers circled/ })).toBeInTheDocument()
+  })
+
   it('toggles finite measured weak-point spans above normalized artwork', () => {
     const geometry = {
       page: { width_mm: 100, height_mm: 50 },

@@ -1,6 +1,7 @@
 import { useId, useMemo } from 'react'
 import type {
   AnalysisCheck,
+  FindingMarker,
   Point,
   PreviewGeometry,
   PreviewPath,
@@ -54,6 +55,16 @@ const finitePoint = (point: Point | undefined): point is Point => (
   Boolean(point) && point!.length === 2 && point!.every((value) => Number.isFinite(value))
 )
 
+const validFindingMarker = (marker: FindingMarker) => (
+  Boolean(marker.id)
+  && ['open_endpoint', 'intersection', 'self_intersection', 'overlap_endpoint'].includes(marker.kind)
+  && finitePoint(marker.location_mm)
+)
+
+const findingMarkerColor = (kind: FindingMarker['kind']) => (
+  kind === 'intersection' ? '#c36b12' : '#c73f32'
+)
+
 const validWeakPoint = (point: PreviewWeakPoint) => (
   finitePoint(point.location_mm)
   && Number.isFinite(point.measurement)
@@ -80,6 +91,7 @@ export function Preview2D({ geometry, selectedCheck, showWeakPoints = false }: P
   const width = Number(geometry.page?.width_mm) || 1
   const height = Number(geometry.page?.height_mm) || 1
   const selectedIds = new Set(selectedCheck?.object_ids ?? [])
+  const findingMarkers = (selectedCheck?.markers ?? []).filter(validFindingMarker)
   const weakPoints = (geometry.weak_points?.points ?? []).filter(validWeakPoint)
   const weakObjectIds = new Set(weakPoints.flatMap((point) => point.object_ids))
   const weakPointLayerVisible = showWeakPoints && weakPoints.length > 0
@@ -112,17 +124,19 @@ export function Preview2D({ geometry, selectedCheck, showWeakPoints = false }: P
   ].sort((left, right) => left.zIndex - right.zIndex || left.sequence - right.sequence)
   const markedPaths = paths.filter((path) => selectedIds.has(path.id))
   const markedRasters = rasterLayers.filter(({ layer }) => selectedIds.has(layer.id))
-  const markedItems = [
-    ...markedPaths.map((path) => ({ id: path.id, point: path.points[0] })),
-    ...markedRasters.map(({ layer }) => ({ id: layer.id, point: layer.corners_mm[0] })),
-  ].filter((item): item is { id: string; point: Point } => Boolean(item.point))
-  const hasMarkedObject = markedItems.length > 0
+  const markedItems = findingMarkers.length > 0
+    ? []
+    : [
+        ...markedPaths.map((path) => ({ id: path.id, point: path.points[0] })),
+        ...markedRasters.map(({ layer }) => ({ id: layer.id, point: layer.corners_mm[0] })),
+      ].filter((item): item is { id: string; point: Point } => Boolean(item.point))
+  const hasMarkedObject = markedItems.length > 0 || findingMarkers.length > 0
 
   return (
     <div
       className="preview-2d"
       role="img"
-      aria-label={`Normalized two-dimensional preview of the submitted cut file${rasterLayers.length ? ` with ${rasterLayers.length} embedded raster image ${rasterLayers.length === 1 ? 'layer' : 'layers'}` : ''}${weakPointLayerVisible ? ` and ${weakPoints.length} potential weak ${weakPoints.length === 1 ? 'point' : 'points'} highlighted` : ''}`}
+      aria-label={`Normalized two-dimensional preview of the submitted cut file${rasterLayers.length ? ` with ${rasterLayers.length} embedded raster image ${rasterLayers.length === 1 ? 'layer' : 'layers'}` : ''}${findingMarkers.length ? ` with ${findingMarkers.length} localized finding ${findingMarkers.length === 1 ? 'marker' : 'markers'} circled` : ''}${weakPointLayerVisible ? ` and ${weakPoints.length} potential weak ${weakPoints.length === 1 ? 'point' : 'points'} highlighted` : ''}`}
     >
       <svg viewBox={`${-width * 0.035} ${-height * 0.035} ${width * 1.07} ${height * 1.07}`} preserveAspectRatio="xMidYMid meet">
         <defs>
@@ -218,6 +232,32 @@ export function Preview2D({ geometry, selectedCheck, showWeakPoints = false }: P
             </g>
           )
         })}
+        {findingMarkers.map((marker, index) => {
+          const radius = Math.max(width, height) * 0.016
+          const color = findingMarkerColor(marker.kind)
+          return (
+            <g
+              key={marker.id}
+              data-finding-marker={marker.id}
+              data-finding-marker-kind={marker.kind}
+              transform={`translate(${marker.location_mm[0]} ${marker.location_mm[1]})`}
+            >
+              <title>{marker.label}</title>
+              <circle r={radius * 1.3} fill={`${color}1a`} stroke={color} strokeWidth={radius * 0.2} />
+              <circle r={radius * 0.78} fill="#fff" stroke={color} strokeWidth={radius * 0.18} />
+              <text
+                x="0"
+                y={radius * 0.28}
+                textAnchor="middle"
+                fontSize={radius * 0.78}
+                fontWeight="800"
+                fill={color}
+              >
+                {index + 1}
+              </text>
+            </g>
+          )
+        })}
         {selectedIds.size > 0 && !hasMarkedObject && selectedCheck?.bounds && !Array.isArray(selectedCheck.bounds) ? (
           <rect
             x={selectedCheck.bounds.x ?? selectedCheck.bounds.min_x ?? 0}
@@ -293,6 +333,7 @@ export function Preview2D({ geometry, selectedCheck, showWeakPoints = false }: P
         <span><i className="legend-engrave" />Engrave</span>
         {rasterLayers.length ? <span><i className="legend-raster" />Embedded image (multiply)</span> : null}
         {selectedCheck ? <span><i className="legend-selected" />Selected finding</span> : null}
+        {findingMarkers.length ? <span><i className="legend-finding" />Circled problem location</span> : null}
         {weakPointLayerVisible ? <span><i className="legend-weak" />Potential weak point</span> : null}
       </div>
     </div>

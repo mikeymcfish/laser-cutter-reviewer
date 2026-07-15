@@ -59,7 +59,18 @@ export function UploadPanel({
     if (candidate) onFileChange(candidate)
   }
 
-  const onInput = (event: ChangeEvent<HTMLInputElement>) => acceptFile(event.target.files?.[0])
+  const onInput = (event: ChangeEvent<HTMLInputElement>) => {
+    const candidate = event.target.files?.[0]
+    // A file input does not fire another change event when the same path is
+    // chosen twice unless its value is cleared after the first selection.
+    event.target.value = ''
+    acceptFile(candidate)
+  }
+  const browseForFile = () => {
+    if (busy || !inputRef.current) return
+    inputRef.current.value = ''
+    inputRef.current.click()
+  }
   const onDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault()
     if (busy) return
@@ -137,12 +148,12 @@ export function UploadPanel({
         }}
         onDrop={onDrop}
         onClick={() => {
-          if (!busy) inputRef.current?.click()
+          browseForFile()
         }}
         onKeyDown={(event) => {
           if (!busy && (event.key === 'Enter' || event.key === ' ')) {
             event.preventDefault()
-            inputRef.current?.click()
+            browseForFile()
           }
         }}
         role="button"

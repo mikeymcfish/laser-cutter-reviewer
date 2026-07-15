@@ -1,8 +1,35 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { Checklist } from './Checklist'
 
 describe('Checklist correction actions', () => {
+  it('returns to All when reanalysis removes the active result category', async () => {
+    const blocker = {
+      rule_id: 'vectors.process_setup',
+      title: 'Cut setup',
+      state: 'blocker',
+      message: 'Fix this stroke.',
+    }
+    const { rerender } = render(
+      <Checklist checks={[blocker]} selectedId={null} onSelect={vi.fn()} />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /Blockers 1/ }))
+    expect(screen.getByRole('button', { name: /Blockers 1/ })).toHaveAttribute('aria-pressed', 'true')
+
+    rerender(
+      <Checklist
+        checks={[{ ...blocker, state: 'pass', message: 'The stroke now passes.' }]}
+        selectedId={null}
+        onSelect={vi.fn()}
+      />,
+    )
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /All 1/ })).toHaveAttribute('aria-pressed', 'true'))
+    expect(screen.getByText('The stroke now passes.')).toBeInTheDocument()
+    expect(screen.queryByText('No checks match this filter.')).not.toBeInTheDocument()
+  })
+
   it('keeps finding disclosure and correction controls as separate accessible buttons', () => {
     const onSelect = vi.fn()
     const onFixAction = vi.fn()

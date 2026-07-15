@@ -28,7 +28,7 @@ from shapely import shortest_line
 from shapely.geometry import LineString, Polygon
 from shapely.ops import polygonize, unary_union
 from shapely.strtree import STRtree
-from svgelements import Close, Move, Path, Shape, SVG, SVGImage, SVGText
+from svgelements import Close, Matrix, Move, Path, Shape, SVG, SVGImage, SVGText
 
 from .models import (
     AnalysisReport,
@@ -37,6 +37,7 @@ from .models import (
     CheckResult,
     DocumentInfo,
     FileInfo,
+    FindingMarker,
     FixAction,
     LabProfile,
     MaterialProfile,
@@ -64,12 +65,14 @@ MAX_FLATTENED_CHORD_MM = 0.5
 MAX_CURVE_SUBDIVISION_DEPTH = 14
 MAX_PAIRWISE_GEOMETRY_CHECKS = 100_000
 MAX_WEAK_POINT_MARKERS = 200
+MAX_FINDING_MARKERS = 400
 TRANSPARENT_PNG_DATA_URI = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAFgAI/7f0M"
     "WQAAAABJRU5ErkJggg=="
 )
 DRAWABLE_TAGS = {"path", "rect", "circle", "ellipse", "line", "polyline", "polygon"}
+NON_RENDERING_CONTAINER_TAGS = {"defs", "symbol", "mask", "marker", "clippath", "pattern"}
 PRESERVE_ASPECT_RATIO_ALIGNMENTS = {
     "xMinYMin", "xMidYMin", "xMaxYMin",
     "xMinYMid", "xMidYMid", "xMaxYMid",
@@ -96,6 +99,10 @@ PRESENTATION_KEYS = {
     "clip-path",
     "mask",
     "filter",
+    "marker",
+    "marker-start",
+    "marker-mid",
+    "marker-end",
 }
 INHERITED_KEYS = {
     "visibility",
@@ -107,6 +114,10 @@ INHERITED_KEYS = {
     "stroke-dasharray",
     "font-family",
     "font-size",
+    "marker",
+    "marker-start",
+    "marker-mid",
+    "marker-end",
 }
 LENGTH_RE = re.compile(
     r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(in|mm|cm|pt|pc|px|%)?\s*$",
@@ -166,6 +177,16 @@ class ElementMeta:
     ambiguous_transform: bool = False
     generated_id: bool = False
     source_order: int = 0
+    in_definition: bool = False
+    instantiated: bool = False
+
+
+@dataclass(frozen=True)
+class CSSRule:
+    selector: str
+    declarations: dict[str, str]
+    specificity: tuple[int, int, int]
+    source_order: int
 
 
 @dataclass
@@ -215,6 +236,87 @@ def _finite_span(line: LineString) -> tuple[tuple[float, float], tuple[float, fl
         (_round(first[0]), _round(first[1])),
         (_round(last[0]), _round(last[1])),
     )
+
+
+def _finite_point_locations(geometry: Any) -> list[tuple[float, float]]:
+    """Return finite point members from a Shapely intersection geometry."""
+    if geometry.is_empty:
+        return []
+    if geometry.geom_type == "Point":
+        coordinate = geometry.coords[0]
+        point = (float(coordinate[0]), float(coordinate[1]))
+        if all(math.isfinite(value) for value in point):
+            return [(_round(point[0]), _round(point[1]))]
+        return []
+    locations: list[tuple[float, float]] = []
+    for member in getattr(geometry, "geoms", ()):
+        locations.extend(_finite_point_locations(member))
+    return locations
+
+
+def _finite_linear_endpoints(geometry: Any) -> list[tuple[float, float]]:
+    """Return the finite endpoints of linear members in an intersection."""
+    if geometry.is_empty:
+        return []
+    if geometry.geom_type in {"LineString", "LinearRing"}:
+        coordinates = list(geometry.coords)
+        if not coordinates:
+            return []
+        endpoints = [coordinates[0], coordinates[-1]]
+        return list(dict.fromkeys(
+            (_round(point[0]), _round(point[1]))
+            for point in endpoints
+            if math.isfinite(float(point[0])) and math.isfinite(float(point[1]))
+        ))
+    locations: list[tuple[float, float]] = []
+    for member in getattr(geometry, "geoms", ()):
+        locations.extend(_finite_linear_endpoints(member))
+    return list(dict.fromkeys(locations))
+
+
+def _self_intersection_locations(
+    line: LineString,
+    remaining_checks: int,
+) -> tuple[list[tuple[float, float]], int, bool]:
+    """Locate non-adjacent segment intersections without unbounded pair work."""
+    coordinates = list(line.coords)
+    edge_count = max(0, len(coordinates) - 1)
+    if edge_count < 3 or remaining_checks <= 0:
+        return [], 0, remaining_checks <= 0
+    records = [
+        (index, LineString((coordinates[index], coordinates[index + 1])))
+        for index in range(edge_count)
+        if coordinates[index] != coordinates[index + 1]
+    ]
+    if len(records) < 3:
+        return [], 0, False
+    segments = [segment for _, segment in records]
+    tree = STRtree(segments)
+    closed = coordinates[0] == coordinates[-1]
+    checks = 0
+    locations: set[tuple[float, float]] = set()
+    for record_index, (source_index, source) in enumerate(records):
+        for candidate_value in tree.query(source):
+            candidate_index = int(candidate_value)
+            if candidate_index <= record_index:
+                continue
+            target_index, target = records[candidate_index]
+            index_distance = abs(source_index - target_index)
+            if index_distance == 1 or (closed and index_distance == edge_count - 1):
+                continue
+            checks += 1
+            if checks > remaining_checks:
+                return sorted(locations), remaining_checks, True
+            intersection = source.intersection(target)
+            if intersection.is_empty:
+                continue
+            if intersection.length > 1e-9:
+                locations.update(_finite_linear_endpoints(intersection))
+            else:
+                locations.update(_finite_point_locations(intersection))
+            if len(locations) >= MAX_FINDING_MARKERS:
+                return sorted(locations)[:MAX_FINDING_MARKERS], checks, True
+    return sorted(locations), checks, False
 
 
 def _narrow_feature_span(
@@ -353,6 +455,52 @@ def _sanitize_preserve_aspect_ratio(value: str | None) -> str:
     return "xMidYMid meet"
 
 
+def _effective_image_dpi(
+    pixel_width: int,
+    pixel_height: int,
+    viewport_width_mm: float,
+    viewport_height_mm: float,
+    preserve_aspect_ratio: str,
+) -> float | None:
+    """Calculate DPI from the transformed viewport and SVG image fitting."""
+    if (
+        pixel_width <= 0
+        or pixel_height <= 0
+        or not math.isfinite(viewport_width_mm)
+        or not math.isfinite(viewport_height_mm)
+        or viewport_width_mm <= 0
+        or viewport_height_mm <= 0
+    ):
+        return None
+    if preserve_aspect_ratio == "none":
+        return min(
+            pixel_width / (viewport_width_mm / 25.4),
+            pixel_height / (viewport_height_mm / 25.4),
+        )
+
+    image_ratio = pixel_width / pixel_height
+    viewport_ratio = viewport_width_mm / viewport_height_mm
+    mode = preserve_aspect_ratio.rsplit(" ", 1)[-1]
+    if mode == "slice":
+        if viewport_ratio >= image_ratio:
+            rendered_width_mm = viewport_width_mm
+            rendered_height_mm = viewport_width_mm / image_ratio
+        else:
+            rendered_height_mm = viewport_height_mm
+            rendered_width_mm = viewport_height_mm * image_ratio
+    else:  # SVG's default meet behavior letterboxes rather than stretching.
+        if viewport_ratio >= image_ratio:
+            rendered_height_mm = viewport_height_mm
+            rendered_width_mm = viewport_height_mm * image_ratio
+        else:
+            rendered_width_mm = viewport_width_mm
+            rendered_height_mm = viewport_width_mm / image_ratio
+    return min(
+        pixel_width / (rendered_width_mm / 25.4),
+        pixel_height / (rendered_height_mm / 25.4),
+    )
+
+
 def _point_xy(point: Any) -> tuple[float, float]:
     if hasattr(point, "x") and hasattr(point, "y"):
         result = float(point.x), float(point.y)
@@ -414,16 +562,33 @@ def _parse_viewbox(value: str | None) -> tuple[float, float, float, float] | Non
     return parts[0], parts[1], parts[2], parts[3]
 
 
-def _document_scale(root: StdET.Element) -> DocumentScale:
-    width_mm, width_unit, width_explicit = _parse_length(root.get("width"))
-    height_mm, height_unit, height_explicit = _parse_length(root.get("height"))
+def _document_scale(
+    root: StdET.Element,
+    rules: list[CSSRule] | None = None,
+) -> DocumentScale:
+    # CSS width/height participate in the SVG viewport cascade. Reading only
+    # the XML attributes can therefore under-report an oversized artboard.
+    # Unsupported CSS is still surfaced separately as a blocking finding.
+    styled = _style_for(root, {}, rules or [])
+    width_value = styled.get("width", root.get("width"))
+    height_value = styled.get("height", root.get("height"))
+    width_mm, width_unit, width_explicit = _parse_length(width_value)
+    height_mm, height_unit, height_explicit = _parse_length(height_value)
+    invalid_declared_width = width_value is not None and width_mm is None
+    invalid_declared_height = height_value is not None and height_mm is None
     viewbox = _parse_viewbox(root.get("viewBox") or root.get("viewbox"))
 
-    if width_mm is None and height_mm is not None and viewbox:
+    if width_mm is None and height_mm is not None and viewbox and not invalid_declared_width:
         width_mm = height_mm * viewbox[2] / viewbox[3]
-    elif height_mm is None and width_mm is not None and viewbox:
+    elif height_mm is None and width_mm is not None and viewbox and not invalid_declared_height:
         height_mm = width_mm * viewbox[3] / viewbox[2]
-    elif width_mm is None and height_mm is None and viewbox:
+    elif (
+        width_mm is None
+        and height_mm is None
+        and viewbox
+        and not invalid_declared_width
+        and not invalid_declared_height
+    ):
         # SVG user units default to CSS pixels. This is useful, but lower
         # confidence than an explicitly declared physical viewport.
         width_mm = viewbox[2] * MM_PER_PX
@@ -519,9 +684,19 @@ def _selector_matches(selector: str, element: StdET.Element) -> bool:
     return bool(id_match or selector_classes or selector_tag or selector == "*")
 
 
-def _css_rules(root: StdET.Element) -> tuple[list[tuple[str, dict[str, str]]], list[str]]:
-    rules: list[tuple[str, dict[str, str]]] = []
+def _selector_specificity(selector: str) -> tuple[int, int, int]:
+    """Return CSS specificity for the simple selectors we support."""
+    return (
+        len(re.findall(r"#[\w:-]+", selector)),
+        len(re.findall(r"\.[\w:-]+", selector)),
+        1 if re.match(r"^[a-zA-Z][\w:-]*", selector) else 0,
+    )
+
+
+def _css_rules(root: StdET.Element) -> tuple[list[CSSRule], list[str]]:
+    rules: list[CSSRule] = []
     unsupported: list[str] = []
+    source_order = 0
     for element in root.iter():
         if _local_name(element.tag) != "style":
             continue
@@ -546,22 +721,36 @@ def _css_rules(root: StdET.Element) -> tuple[list[tuple[str, dict[str, str]]], l
                 if any(token in selector for token in (" ", ">", "+", "~", ":", "[")):
                     unsupported.append(f"complex selector {selector[:160]}")
                 else:
-                    rules.append((selector, declarations))
+                    rules.append(
+                        CSSRule(
+                            selector=selector,
+                            declarations=declarations,
+                            specificity=_selector_specificity(selector),
+                            source_order=source_order,
+                        )
+                    )
+                    source_order += 1
     return rules, sorted(set(unsupported))
 
 
 def _style_for(
     element: StdET.Element,
     inherited: dict[str, str],
-    rules: list[tuple[str, dict[str, str]]],
+    rules: list[CSSRule],
 ) -> dict[str, str]:
     style = {key: value for key, value in inherited.items() if key in INHERITED_KEYS}
     for key in PRESENTATION_KEYS:
         if key in element.attrib:
             style[key] = element.attrib[key].strip()
-    for selector, declarations in rules:
-        if _selector_matches(selector, element):
-            style.update(declarations)
+    winners: dict[str, tuple[tuple[int, int, int], int]] = {}
+    for rule in rules:
+        if not _selector_matches(rule.selector, element):
+            continue
+        rank = (rule.specificity, rule.source_order)
+        for key, value in rule.declarations.items():
+            if key not in winners or rank >= winners[key]:
+                style[key] = value
+                winners[key] = rank
     style.update(_declarations(element.get("style")))
     return style
 
@@ -600,9 +789,75 @@ def _is_ambiguous_transform(transform: str | None) -> bool:
     return False
 
 
+def _matrix_is_nonorthogonal(matrix: Any) -> bool:
+    if matrix is None:
+        return False
+    try:
+        a, b, c, d = (float(matrix.a), float(matrix.b), float(matrix.c), float(matrix.d))
+    except (AttributeError, TypeError, ValueError):
+        return True
+    if any(not math.isfinite(item) for item in (a, b, c, d)):
+        return True
+    first_length = math.hypot(a, b)
+    second_length = math.hypot(c, d)
+    if first_length <= 1e-12 or second_length <= 1e-12:
+        return True
+    normalized_dot = abs(a * c + b * d) / (first_length * second_length)
+    return normalized_dot > 1e-7
+
+
+def _transform_is_nonorthogonal(transform: str | None) -> bool:
+    if not transform:
+        return False
+    try:
+        return _matrix_is_nonorthogonal(Matrix(transform))
+    except (TypeError, ValueError, AttributeError):
+        return True
+
+
+def _instantiated_definition_elements(root: StdET.Element) -> set[int]:
+    """Return definition-tree elements reached by a rendered local <use>."""
+    by_id = {element.get("id"): element for element in root.iter() if element.get("id")}
+    in_definition: set[int] = set()
+
+    def mark_definition_tree(element: StdET.Element, parent_definition: bool) -> None:
+        is_definition = parent_definition or _local_name(element.tag).lower() in NON_RENDERING_CONTAINER_TAGS
+        if is_definition:
+            in_definition.add(id(element))
+        for child in element:
+            mark_definition_tree(child, is_definition)
+
+    mark_definition_tree(root, False)
+    instantiated: set[int] = set()
+
+    def href_for(element: StdET.Element) -> str:
+        return element.get("href") or element.get("{http://www.w3.org/1999/xlink}href") or ""
+
+    def collect(element: StdET.Element, seen_targets: set[str]) -> None:
+        instantiated.add(id(element))
+        if _local_name(element.tag).lower() == "use":
+            href = href_for(element)
+            target_id = href[1:] if href.startswith("#") else ""
+            if target_id and target_id not in seen_targets and target_id in by_id:
+                collect(by_id[target_id], seen_targets | {target_id})
+        for child in element:
+            collect(child, seen_targets)
+
+    # Only uses in the rendered document tree begin an instantiation. Nested
+    # uses inside their referenced definition are followed recursively above.
+    for element in root.iter():
+        if _local_name(element.tag).lower() != "use" or id(element) in in_definition:
+            continue
+        href = href_for(element)
+        target_id = href[1:] if href.startswith("#") else ""
+        if target_id and target_id in by_id:
+            collect(by_id[target_id], {target_id})
+    return instantiated
+
+
 def _collect_metadata(
     root: StdET.Element,
-    rules: list[tuple[str, dict[str, str]]],
+    rules: list[CSSRule],
 ) -> tuple[dict[str, ElementMeta], list[str], int, list[str]]:
     metadata: dict[str, ElementMeta] = {}
     unsupported: list[str] = []
@@ -610,6 +865,7 @@ def _collect_metadata(
     sequence = 0
     id_counts: dict[str, int] = {}
     duplicate_source_ids: set[str] = set()
+    instantiated_definitions = _instantiated_definition_elements(root)
 
     def walk(
         element: StdET.Element,
@@ -617,9 +873,12 @@ def _collect_metadata(
         parent_ambiguous: bool,
         parent_hidden: bool,
         inherited_effects: list[str],
+        parent_definition: bool,
     ) -> None:
         nonlocal sequence, hidden_count
         tag = _local_name(element.tag)
+        in_definition = parent_definition or tag.lower() in NON_RENDERING_CONTAINER_TAGS
+        instantiated = id(element) in instantiated_definitions
         style = _style_for(element, inherited, rules)
         declared_id = element.get("id")
         generated_id = False
@@ -632,9 +891,15 @@ def _collect_metadata(
         hidden = parent_hidden or _is_hidden(style)
         ambiguous = parent_ambiguous or _is_ambiguous_transform(element.get("transform"))
         own_effects: list[str] = []
+        if tag.lower() == "image" and _transform_is_nonorthogonal(element.get("transform")):
+            own_effects.append("non-orthogonal raster transform")
         if "!" in (element.get("style") or ""):
             own_effects.append("inline CSS priority (!important) declaration")
         for key in ("clip-path", "mask", "filter"):
+            value = style.get(key) or element.get(key)
+            if value and value.strip().lower() != "none":
+                own_effects.append(key)
+        for key in ("marker", "marker-start", "marker-mid", "marker-end"):
             value = style.get(key) or element.get(key)
             if value and value.strip().lower() != "none":
                 own_effects.append(key)
@@ -646,7 +911,7 @@ def _collect_metadata(
                 opacity_value = float(opacity)
                 if not math.isfinite(opacity_value) or not 0 <= opacity_value <= 1:
                     own_effects.append(f"invalid {opacity_key}")
-                elif 0 < opacity_value < 1:
+                elif 0 < opacity_value < 1 and not (tag.lower() == "image" and opacity_key == "opacity"):
                     own_effects.append(f"partial {opacity_key}")
                 elif opacity_value == 0 and opacity_key != "opacity":
                     own_effects.append(f"zero {opacity_key}")
@@ -671,17 +936,20 @@ def _collect_metadata(
                 ambiguous_transform=ambiguous,
                 generated_id=generated_id,
                 source_order=sequence - 1,
+                in_definition=in_definition,
+                instantiated=instantiated,
             )
             if hidden:
                 hidden_count += 1
-            unsupported.extend(f"{object_id}: {item}" for item in effects)
+            if not in_definition or instantiated:
+                unsupported.extend(f"{object_id}: {item}" for item in effects)
         scope = element.get("id") or tag
         descendant_effects = list(inherited_effects)
         descendant_effects.extend(f"ancestor {scope}: {item}" for item in own_effects)
         for child in element:
-            walk(child, style, ambiguous, hidden, descendant_effects)
+            walk(child, style, ambiguous, hidden, descendant_effects, in_definition)
 
-    walk(root, {}, False, False, [])
+    walk(root, {}, False, False, [], False)
     return metadata, sorted(set(unsupported)), hidden_count, sorted(duplicate_source_ids)
 
 
@@ -793,6 +1061,46 @@ def _neutralize_image_payloads(root: StdET.Element) -> None:
                 found_reference = True
         if not found_reference:
             element.set("href", TRANSPARENT_PNG_DATA_URI)
+
+
+def _materialize_computed_styles(
+    root: StdET.Element,
+    metadata: dict[str, ElementMeta],
+) -> None:
+    """Pin the validated cascade inline before svgelements normalizes it."""
+    for element in root.iter():
+        meta = metadata.get(element.get("id", ""))
+        if meta is None:
+            continue
+        declarations = _declarations(element.get("style"))
+        for key in PRESENTATION_KEYS:
+            if key in meta.style:
+                declarations[key] = meta.style[key]
+        if declarations:
+            element.set("style", ";".join(f"{key}:{value}" for key, value in declarations.items()))
+
+
+def _wrap_nonrendering_containers(root: StdET.Element) -> None:
+    """Place definition-only containers under <defs> for geometry parsing.
+
+    Some SVG libraries emit a top-level <symbol>, <mask>, or <marker> as if it
+    were painted. Wrapping those containers in the analysis-only XML preserves
+    local <use>/URL references while preventing phantom vectors.
+    """
+    def walk(parent: StdET.Element, inside_defs: bool) -> None:
+        for index, child in enumerate(list(parent)):
+            tag = _local_name(child.tag).lower()
+            if tag in NON_RENDERING_CONTAINER_TAGS - {"defs"} and not inside_defs:
+                namespace = child.tag.rsplit("}", 1)[0] + "}" if "}" in child.tag else ""
+                wrapper = StdET.Element(f"{namespace}defs")
+                parent.remove(child)
+                parent.insert(index, wrapper)
+                wrapper.append(child)
+                walk(child, True)
+                continue
+            walk(child, inside_defs or tag == "defs")
+
+    walk(root, False)
 
 
 def _normalize_color(value: Any) -> str | None:
@@ -908,6 +1216,9 @@ def _image_inventory(
         if _local_name(element.tag) != "image":
             continue
         object_id = element.get("id", "image")
+        meta = metadata.get(object_id)
+        if meta and meta.in_definition and not meta.instantiated:
+            continue
         references = _image_references(element)
         if any(not reference.lower().startswith(("data:", "#")) for reference in references):
             external.append(object_id)
@@ -953,9 +1264,20 @@ def _image_inventory(
                 preview_bytes_used += len(base64.b64decode(preview_data_url.split(",", 1)[1]))
             width_mm, _, _ = _parse_length(element.get("width"))
             height_mm, _, _ = _parse_length(element.get("height"))
-            dpi = None
-            if width_mm and height_mm:
-                dpi = min(pixel_width / (width_mm / 25.4), pixel_height / (height_mm / 25.4))
+            preserve_aspect_ratio = _sanitize_preserve_aspect_ratio(
+                element.get("preserveAspectRatio")
+            )
+            dpi = (
+                _effective_image_dpi(
+                    pixel_width,
+                    pixel_height,
+                    width_mm,
+                    height_mm,
+                    preserve_aspect_ratio,
+                )
+                if width_mm and height_mm
+                else None
+            )
             images.append(
                 {
                     "id": object_id,
@@ -963,14 +1285,12 @@ def _image_inventory(
                     "pixel_width": pixel_width,
                     "pixel_height": pixel_height,
                     "effective_dpi": _round(dpi, 1) if dpi else None,
-                    "hidden": metadata.get(object_id).hidden if object_id in metadata else False,
-                    "opacity": _image_opacity(metadata.get(object_id)),
+                    "hidden": meta.hidden if meta else False,
+                    "opacity": _image_opacity(meta),
                     "preview_data_url": preview_data_url,
                     "preview_pixel_width": preview_width,
                     "preview_pixel_height": preview_height,
-                    "preserve_aspect_ratio": _sanitize_preserve_aspect_ratio(
-                        element.get("preserveAspectRatio")
-                    ),
+                    "preserve_aspect_ratio": preserve_aspect_ratio,
                 }
             )
         except (
@@ -1006,15 +1326,20 @@ def _live_text_inventory(
             continue
         object_id = element.get("id", "text")
         meta = metadata.get(object_id)
+        if meta and meta.in_definition and not meta.instantiated:
+            continue
         if meta and meta.hidden:
             continue
         family_value = meta.style.get("font-family", "") if meta else ""
-        requested = {
+        requested = [
             family.strip(" '\"").lower()
             for family in family_value.split(",")
             if family.strip(" '\"")
-        }
-        if requested and requested.intersection(embedded_families):
+        ]
+        # CSS chooses the first available family. We cannot assume a local
+        # primary font will be present merely because a later fallback was
+        # embedded, so the primary family itself must be embedded.
+        if requested and requested[0] in embedded_families:
             valid.append(object_id)
         else:
             missing.append(object_id)
@@ -1329,6 +1654,7 @@ def _extract_paths(
                     continue
                 raise SVGAnalysisError(f"Raster image bounds on {source_id} are non-finite or invalid.")
             matrix = getattr(element, "transform", None)
+            nonorthogonal_transform = _matrix_is_nonorthogonal(matrix)
             corners_px = [
                 _transform_xy(x, y, matrix),
                 _transform_xy(x + width, y, matrix),
@@ -1356,7 +1682,7 @@ def _extract_paths(
                     color=None,
                     fill=None,
                     dash=None,
-                    ambiguous_transform=False,
+                    ambiguous_transform=nonorthogonal_transform,
                     source_id=source_id,
                     raster_viewport_aspect_ratio=width / height,
                 )
@@ -1504,6 +1830,24 @@ def _bounds_for_ids(paths: list[ExtractedPath], object_ids: Iterable[str]) -> li
     ]
 
 
+def _paths_fit_page(
+    paths: Iterable[ExtractedPath],
+    width_mm: float,
+    height_mm: float,
+    tolerance_mm: float,
+) -> bool:
+    for item in paths:
+        bounds = item.preview.bounds
+        if bounds and (
+            bounds.x_mm < -tolerance_mm
+            or bounds.y_mm < -tolerance_mm
+            or bounds.x_mm + bounds.width_mm > width_mm + tolerance_mm
+            or bounds.y_mm + bounds.height_mm > height_mm + tolerance_mm
+        ):
+            return False
+    return True
+
+
 def _preview_ids_for_source_ids(
     paths: list[ExtractedPath], object_ids: Iterable[str]
 ) -> list[str]:
@@ -1539,12 +1883,14 @@ def _fixable_stroke_paths(
             item.color == "#000000"
             and item.fill is None
             and width_mm is not None
+            and width_mm > 1e-9
             and width_mm <= max_fixable_width_mm + 1e-6
         )
         wrong_color_hairline = bool(
             item.color != "#000000"
             and item.color not in other_process_colors
             and width_mm is not None
+            and width_mm > 1e-9
             and width_mm <= hairline_threshold_mm + 1e-6
         )
         if (
@@ -1628,6 +1974,7 @@ def _add_check(
     fix: str | None = None,
     object_ids: Iterable[str] = (),
     bounds: Iterable[Bounds] = (),
+    markers: Iterable[FindingMarker] = (),
     fix_actions: Iterable[FixAction] = (),
 ) -> None:
     checks.append(
@@ -1640,6 +1987,7 @@ def _add_check(
             fix=fix,
             object_ids=list(object_ids),
             bounds=list(bounds),
+            markers=list(markers),
             fix_actions=list(fix_actions),
         )
     )
@@ -1832,17 +2180,19 @@ def _root_aspect_ratio_is_reliable(root: StdET.Element) -> bool:
 
 def _root_viewport_styles_match(
     root: StdET.Element,
-    rules: list[tuple[str, dict[str, str]]],
+    rules: list[CSSRule],
     scale: DocumentScale,
 ) -> bool:
     """Reject a CSS viewport that disagrees with the physical root attributes."""
     styled = _style_for(root, {}, rules)
-    for key, expected_mm in (("width", scale.width_mm), ("height", scale.height_mm)):
+    for key in ("width", "height"):
         if key not in styled:
             continue
+        expected_mm, _, expected_explicit = _parse_length(root.get(key))
         measured_mm, _, explicit = _parse_length(styled[key])
         if (
             not explicit
+            or not expected_explicit
             or measured_mm is None
             or expected_mm is None
             or not math.isclose(measured_mm, expected_mm, rel_tol=1e-9, abs_tol=1e-7)
@@ -1943,7 +2293,9 @@ def _paths_for_fix_verification(
     profile: LabProfile,
 ) -> list[ExtractedPath]:
     analysis_root = StdET.fromstring(StdET.tostring(root, encoding="utf-8"))
+    _materialize_computed_styles(analysis_root, metadata)
     _neutralize_image_payloads(analysis_root)
+    _wrap_nonrendering_containers(analysis_root)
     paths, _, _ = _extract_paths(
         StdET.tostring(analysis_root, encoding="unicode"),
         metadata,
@@ -1979,7 +2331,8 @@ def fix_artboard(
         raise ArtboardFixError(
             "Automatic artboard correction is unavailable for SVGs with reusable <use> or live text geometry."
         )
-    scale = _document_scale(root)
+    rules, unsupported_css = _css_rules(root)
+    scale = _document_scale(root, rules)
     original_scales = _artboard_scale_mm_per_unit(scale)
     if original_scales is None or not _root_aspect_ratio_is_reliable(root):
         raise ArtboardFixError(
@@ -2002,7 +2355,6 @@ def fix_artboard(
     if already_accepted:
         raise ArtboardFixError("The SVG artboard already satisfies the assignment size policy.")
 
-    rules, unsupported_css = _css_rules(root)
     if not _root_viewport_styles_match(root, rules, scale):
         raise ArtboardFixError(
             "CSS width or height conflicts with the SVG's physical viewport, so the artboard cannot be corrected safely."
@@ -2017,6 +2369,15 @@ def fix_artboard(
         raise ArtboardFixError("Embed or replace every raster image before correcting the artboard.")
 
     before_paths = _paths_for_fix_verification(root, metadata, assignment, profile)
+    if not _paths_fit_page(
+        before_paths,
+        target_width_mm,
+        target_height_mm,
+        assignment.page_tolerance_mm,
+    ):
+        raise ArtboardFixError(
+            "The smaller artboard would leave artwork outside its bounds, so no copy was created."
+        )
     _set_artboard_viewport(
         root,
         target_width_mm=target_width_mm,
@@ -2036,7 +2397,8 @@ def fix_artboard(
         raise ArtboardFixError("The artboard-corrected SVG would exceed the upload size limit.")
 
     verify_root, _ = _validate_xml_safety(fixed_data, profile.limits)
-    verify_scale = _document_scale(verify_root)
+    verify_rules, verify_css = _css_rules(verify_root)
+    verify_scale = _document_scale(verify_root, verify_rules)
     verify_scales = _artboard_scale_mm_per_unit(verify_scale)
     if (
         verify_scales is None
@@ -2051,7 +2413,6 @@ def fix_artboard(
         or not math.isclose(verify_scales[1], original_scales[1], rel_tol=1e-9, abs_tol=1e-11)
     ):
         raise ArtboardFixError("The corrected artboard did not preserve the original physical scale.")
-    verify_rules, verify_css = _css_rules(verify_root)
     verify_metadata, verify_effects, _, verify_duplicates = _collect_metadata(verify_root, verify_rules)
     _, verify_external_images, verify_invalid_images = _image_inventory(
         verify_root, verify_metadata, profile.limits
@@ -2094,8 +2455,8 @@ def fix_strokes(
         raise StrokeFixError(
             "Automatic stroke correction is unavailable for SVGs that contain reusable <use> instances."
         )
-    scale = _document_scale(root)
     rules, unsupported_css = _css_rules(root)
+    scale = _document_scale(root, rules)
     metadata, unsupported_effects, _, duplicate_source_ids = _collect_metadata(root, rules)
     _, external_images, invalid_images = _image_inventory(root, metadata, profile.limits)
     if duplicate_source_ids:
@@ -2105,7 +2466,9 @@ def fix_strokes(
     if external_images or invalid_images:
         raise StrokeFixError("Embed or replace every raster image before creating a corrected SVG copy.")
     analysis_root = StdET.fromstring(StdET.tostring(root, encoding="utf-8"))
+    _materialize_computed_styles(analysis_root, metadata)
     _neutralize_image_payloads(analysis_root)
+    _wrap_nonrendering_containers(analysis_root)
     if scale.width_mm and not analysis_root.get("width"):
         analysis_root.set("width", f"{scale.width_mm / MM_PER_PX}px")
     if scale.height_mm and not analysis_root.get("height"):
@@ -2151,8 +2514,8 @@ def fix_strokes(
     # Re-run the same parser on the output. The copy is only returned when each
     # changed source now resolves to the configured cut process at 0.001 in.
     verify_root, _ = _validate_xml_safety(fixed_data, profile.limits)
-    verify_scale = _document_scale(verify_root)
     verify_rules, verify_css = _css_rules(verify_root)
+    verify_scale = _document_scale(verify_root, verify_rules)
     verify_metadata, verify_effects, _, verify_duplicates = _collect_metadata(verify_root, verify_rules)
     if verify_css or verify_effects or verify_duplicates:
         raise StrokeFixError("The corrected SVG did not pass the required safety verification.")
@@ -2160,7 +2523,9 @@ def fix_strokes(
         verify_root.set("width", f"{verify_scale.width_mm / MM_PER_PX}px")
     if verify_scale.height_mm and not verify_root.get("height"):
         verify_root.set("height", f"{verify_scale.height_mm / MM_PER_PX}px")
+    _materialize_computed_styles(verify_root, verify_metadata)
     _neutralize_image_payloads(verify_root)
+    _wrap_nonrendering_containers(verify_root)
     verify_paths, _, _ = _extract_paths(
         StdET.tostring(verify_root, encoding="unicode"),
         verify_metadata,
@@ -2194,15 +2559,17 @@ def analyze_svg(
         has_live_text_elements = any(
             _local_name(element.tag).lower() == "text" for element in root.iter()
         )
-        scale = _document_scale(root)
         rules, unsupported_css = _css_rules(root)
+        scale = _document_scale(root, rules)
         metadata, unsupported_effects, hidden_count, duplicate_source_ids = _collect_metadata(root, rules)
         embedded_families, font_errors = _embedded_fonts(root, profile.limits.max_upload_bytes)
         images, external_images, invalid_images = _image_inventory(
             root, metadata, profile.limits
         )
         embedded_text, missing_text = _live_text_inventory(root, metadata, embedded_families)
+        _materialize_computed_styles(root, metadata)
         _neutralize_image_payloads(root)
+        _wrap_nonrendering_containers(root)
         # Give inferred documents an explicit internal viewport so svgelements'
         # default 300x150 viewport cannot distort normalized output.
         if scale.width_mm and not root.get("width"):
@@ -2219,6 +2586,12 @@ def analyze_svg(
             set(external_images + invalid_images),
         )
         raster_paths = [item for item in paths if item.preview.operation == "raster-engrave"]
+        for source_id in sorted(
+            {item.source_id for item in raster_paths if item.ambiguous_transform}
+        ):
+            effect = f"{source_id}: non-orthogonal raster transform"
+            if effect not in unsupported_effects:
+                unsupported_effects.append(effect)
         raster_assets: list[PreviewRasterAsset] = []
         raster_layers: list[PreviewRasterLayer] = []
         for image_index, image in enumerate(images, start=1):
@@ -2226,17 +2599,25 @@ def analyze_svg(
             image["preview_ids"] = [item.preview.id for item in placements] or [image["id"]]
             image["bounds"] = [item.preview.bounds for item in placements if item.preview.bounds]
             dpi_values: list[float] = []
-            for placement in placements:
-                bounds = placement.preview.bounds
-                if bounds and bounds.width_mm > 0 and bounds.height_mm > 0:
-                    dpi_values.append(
-                        min(
-                            image["pixel_width"] / (bounds.width_mm / 25.4),
-                            image["pixel_height"] / (bounds.height_mm / 25.4),
-                        )
+            transform_reliable = not any(item.ambiguous_transform for item in placements)
+            for placement in placements if transform_reliable else []:
+                corners = placement.preview.points[:4]
+                if len(corners) == 4:
+                    viewport_width_mm = math.dist(corners[0], corners[1])
+                    viewport_height_mm = math.dist(corners[1], corners[2])
+                    dpi = _effective_image_dpi(
+                        image["pixel_width"],
+                        image["pixel_height"],
+                        viewport_width_mm,
+                        viewport_height_mm,
+                        image["preserve_aspect_ratio"],
                     )
+                    if dpi is not None:
+                        dpi_values.append(dpi)
             if dpi_values:
                 image["effective_dpi"] = _round(min(dpi_values), 1)
+            elif not transform_reliable:
+                image["effective_dpi"] = None
             if image["preview_data_url"]:
                 asset_id = f"raster-asset-{image_index:04d}"
                 raster_assets.append(
@@ -2417,6 +2798,12 @@ def analyze_svg(
         and not invalid_images
         and not has_use_elements
         and not has_live_text_elements
+        and _paths_fit_page(
+            paths,
+            artboard_target_width_mm,
+            artboard_target_height_mm,
+            assignment.page_tolerance_mm,
+        )
     )
     artboard_fix_actions = [
         FixAction(
@@ -2593,6 +2980,26 @@ def analyze_svg(
     )
 
     open_cuts = [item for item in cut_paths if not item.preview.closed]
+    open_markers: list[FindingMarker] = []
+    for item in open_cuts:
+        coordinates = list(item.line.coords)
+        endpoint_locations = [] if not coordinates else [coordinates[0], coordinates[-1]]
+        seen_endpoints: set[tuple[float, float]] = set()
+        for endpoint_index, coordinate in enumerate(endpoint_locations, start=1):
+            location = (_round(coordinate[0]), _round(coordinate[1]))
+            if location in seen_endpoints:
+                continue
+            seen_endpoints.add(location)
+            open_markers.append(
+                FindingMarker(
+                    id=f"open-endpoint-{len(open_markers) + 1:04d}",
+                    kind="open_endpoint",
+                    label=f"Open endpoint {endpoint_index} on {item.preview.id}",
+                    object_ids=[item.preview.id],
+                    location_mm=location,
+                )
+            )
+    open_markers = open_markers[:MAX_FINDING_MARKERS]
     _add_check(
         checks,
         rule_id="geometry.closed_cuts",
@@ -2603,10 +3010,24 @@ def analyze_svg(
         fix="Join the highlighted end anchors in Illustrator so each through-cut outline is a closed path." if open_cuts else None,
         object_ids=[item.preview.id for item in open_cuts],
         bounds=[item.preview.bounds for item in open_cuts if item.preview.bounds],
+        markers=open_markers,
     )
 
     degenerate = [item for item in cut_paths if item.line.length <= max(0.01, material.kerf_mm / 2)]
     self_intersections = [item for item in cut_paths if not item.line.is_simple]
+    self_marker_locations: dict[tuple[str, float, float], tuple[float, float]] = {}
+    self_marker_checks = 0
+    self_marker_limit_reached = False
+    for item in self_intersections:
+        locations, checks_used, limit_reached = _self_intersection_locations(
+            item.line,
+            max(0, MAX_PAIRWISE_GEOMETRY_CHECKS - self_marker_checks),
+        )
+        self_marker_checks += checks_used
+        self_marker_limit_reached = self_marker_limit_reached or limit_reached
+        for location in locations:
+            self_marker_locations[(item.preview.id, *location)] = location
+    self_marker_limit_reached = self_marker_limit_reached or len(self_marker_locations) > MAX_FINDING_MARKERS
     seen: dict[tuple[tuple[float, float], ...], ExtractedPath] = {}
     duplicates: list[ExtractedPath] = []
     for item in cut_paths:
@@ -2617,7 +3038,9 @@ def analyze_svg(
             seen[key] = item
     duplicates = list({item.preview.id: item for item in duplicates}.values())
     overlap_ids: set[str] = set()
+    overlap_marker_locations: dict[tuple[str, str, float, float], tuple[float, float]] = {}
     crossing_ids: set[str] = set()
+    crossing_marker_locations: dict[tuple[str, str, float, float], tuple[float, float]] = {}
     close_ids: set[str] = set()
     weak_point_candidates: list[WeakPointCandidate] = []
     weak_marker_limit_reached = False
@@ -2675,8 +3098,14 @@ def analyze_svg(
                 # still a coincident cut overlap.
                 if intersection.length > 0.01:
                     overlap_ids.update((item.preview.id, other.preview.id))
+                    object_pair = tuple(sorted((item.preview.id, other.preview.id)))
+                    for location in _finite_linear_endpoints(intersection):
+                        overlap_marker_locations[(*object_pair, *location)] = location
                 elif not intersection.is_empty:
                     crossing_ids.update((item.preview.id, other.preview.id))
+                    object_pair = tuple(sorted((item.preview.id, other.preview.id)))
+                    for location in _finite_point_locations(intersection):
+                        crossing_marker_locations[(*object_pair, *location)] = location
             if topology_limit_reached:
                 break
     topology_ids = set(item.preview.id for item in degenerate + self_intersections + duplicates) | overlap_ids
@@ -2695,6 +3124,33 @@ def analyze_svg(
         topology_evidence.append(
             f"Pairwise topology work exceeded the {MAX_PAIRWISE_GEOMETRY_CHECKS:,}-comparison safety limit"
         )
+    if self_marker_limit_reached:
+        topology_evidence.append("Localized self-intersection markers were capped by the geometry safety limit")
+    topology_markers = [
+        FindingMarker(
+            id=f"self-intersection-{index:04d}",
+            kind="self_intersection",
+            label=f"Self-intersection on {object_id}",
+            object_ids=[object_id],
+            location_mm=location,
+        )
+        for index, ((object_id, _x, _y), location) in enumerate(
+            sorted(self_marker_locations.items())[:MAX_FINDING_MARKERS], start=1
+        )
+    ]
+    remaining_marker_slots = max(0, MAX_FINDING_MARKERS - len(topology_markers))
+    topology_markers.extend(
+        FindingMarker(
+            id=f"overlap-endpoint-{index:04d}",
+            kind="overlap_endpoint",
+            label=f"Coincident overlap endpoint between {left_id} and {right_id}",
+            object_ids=[left_id, right_id],
+            location_mm=location,
+        )
+        for index, ((left_id, right_id, _x, _y), location) in enumerate(
+            sorted(overlap_marker_locations.items())[:remaining_marker_slots], start=1
+        )
+    )
     _add_check(
         checks,
         rule_id="geometry.topology",
@@ -2709,6 +3165,7 @@ def analyze_svg(
         fix="Use Illustrator's Outline/Pathfinder tools to remove duplicates, self-intersections, zero-length paths, and shared cut segments." if topology_ids else None,
         object_ids=sorted(topology_ids),
         bounds=_bounds_for_ids(paths, topology_ids),
+        markers=topology_markers,
     )
     _add_check(
         checks,
@@ -2720,6 +3177,18 @@ def analyze_svg(
         fix="Inspect the highlighted intersections and separate or combine paths if the crossing is accidental." if crossing_ids else None,
         object_ids=sorted(crossing_ids),
         bounds=_bounds_for_ids(paths, crossing_ids),
+        markers=[
+            FindingMarker(
+                id=f"intersection-{index:04d}",
+                kind="intersection",
+                label=f"Crossing or touch between {left_id} and {right_id}",
+                object_ids=[left_id, right_id],
+                location_mm=location,
+            )
+            for index, ((left_id, right_id, _x, _y), location) in enumerate(
+                sorted(crossing_marker_locations.items())[:MAX_FINDING_MARKERS], start=1
+            )
+        ],
     )
 
     effect_source_ids = sorted({entry.split(":", 1)[0] for entry in unsupported_effects})
@@ -2910,6 +3379,66 @@ def analyze_svg(
                 )
             else:
                 weak_location_failure = True
+
+    # Separate nested contours describe a material wall (for example a frame
+    # or ring). Scanning each contour as a solid polygon cannot see that wall,
+    # so explicitly measure the shortest span between nested boundaries.
+    nested_width_checks = 0
+    if len(cut_polygons) > 1:
+        polygon_tree = STRtree([polygon for _, polygon in cut_polygons])
+        for index, (left_item, left_polygon) in enumerate(cut_polygons):
+            for candidate_value in polygon_tree.query(left_polygon):
+                candidate_index = int(candidate_value)
+                if candidate_index <= index:
+                    continue
+                nested_width_checks += 1
+                if weak_width_checks + nested_width_checks > MAX_PAIRWISE_GEOMETRY_CHECKS:
+                    weak_width_limit_reached = True
+                    break
+                right_item, right_polygon = cut_polygons[candidate_index]
+                if left_polygon.contains(right_polygon):
+                    outer_item, outer_polygon = left_item, left_polygon
+                    inner_item, inner_polygon = right_item, right_polygon
+                elif right_polygon.contains(left_polygon):
+                    outer_item, outer_polygon = right_item, right_polygon
+                    inner_item, inner_polygon = left_item, left_polygon
+                else:
+                    continue
+                wall_line = shortest_line(outer_polygon.boundary, inner_polygon.boundary)
+                wall_span = _finite_span(wall_line)
+                wall_width = float(wall_line.length)
+                if (
+                    wall_span is None
+                    or not math.isfinite(wall_width)
+                    or wall_width <= 1e-9
+                    or wall_width >= material.min_bridge_mm
+                ):
+                    continue
+                object_ids = tuple(sorted((outer_item.preview.id, inner_item.preview.id)))
+                fragile_ids.update(object_ids)
+                clearances.append(wall_width)
+                wall_location = (
+                    _round((wall_span[0][0] + wall_span[1][0]) / 2),
+                    _round((wall_span[0][1] + wall_span[1][1]) / 2),
+                )
+                weak_marker_limit_reached = (
+                    _retain_weak_candidate(
+                        weak_point_candidates,
+                        WeakPointCandidate(
+                            kind="narrow_feature",
+                            label="Thin wall between nested cuts",
+                            object_ids=object_ids,
+                            location_mm=wall_location,
+                            span_mm=wall_span,
+                            measurement=wall_width,
+                            threshold=material.min_bridge_mm,
+                            unit="mm",
+                        ),
+                    )
+                    or weak_marker_limit_reached
+                )
+            if weak_width_limit_reached:
+                break
 
     weak_point_candidates.sort(key=_weak_candidate_key)
     if len(weak_point_candidates) > MAX_WEAK_POINT_MARKERS:

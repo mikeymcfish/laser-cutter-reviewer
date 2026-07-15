@@ -503,12 +503,12 @@ export default function App() {
                         disabled={weakPoints.length === 0}
                         title={
                           weakPoints.length
-                            ? `Show ${weakPoints.length} material-dependent weak-point estimate${weakPoints.length === 1 ? '' : 's'}`
+                            ? `${showWeakPoints ? 'Hide' : 'Show'} ${weakPoints.length} material-dependent weak-point estimate${weakPoints.length === 1 ? '' : 's'}`
                             : weakPointStatus === 'partial' || weakPointStatus === 'unavailable'
                               ? weakPointMessage || 'Weak-point locations could not be fully verified.'
                               : 'No localized weak points fall below the selected material guidelines.'
                         }
-                      ><WarningIcon size={14} /> Weak points{weakPoints.length ? ` (${weakPoints.length})` : ''}</button>
+                      ><WarningIcon size={14} /> {showWeakPoints ? 'Hide weak points' : 'Weak points'}{weakPoints.length ? ` (${weakPoints.length})` : ''}</button>
                       <button
                         type="button"
                         className={viewMode === '3d' ? 'is-active' : ''}
@@ -528,6 +528,7 @@ export default function App() {
                         kerfMm={kerfMm}
                         previewAppearance={selectedMaterial?.preview}
                         showWeakPoints={showWeakPoints}
+                        selectedCheck={selectedCheck}
                       />
                     </Suspense>
                   ) : <Preview2D geometry={report.geometry} selectedCheck={selectedCheck} showWeakPoints={showWeakPoints} />}

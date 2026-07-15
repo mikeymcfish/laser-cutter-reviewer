@@ -143,6 +143,7 @@ export interface AnalysisCheck {
   fix?: string | null
   help?: string
   object_ids?: string[]
+  markers?: FindingMarker[]
   fix_actions?: FixAction[]
   bounds?: Array<{
     x_mm?: number
@@ -160,6 +161,14 @@ export interface AnalysisCheck {
     max_y?: number
   }
   [key: string]: unknown
+}
+
+export interface FindingMarker {
+  id: string
+  kind: 'open_endpoint' | 'intersection' | 'self_intersection' | 'overlap_endpoint'
+  label: string
+  object_ids: string[]
+  location_mm: Point
 }
 
 interface FixActionBase {

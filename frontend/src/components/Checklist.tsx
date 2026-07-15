@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { AnalysisCheck, CheckStatus, FixAction } from '../types'
 import { checkKey, checkStatus } from '../types'
 import { CheckIcon, DownloadIcon, EyeIcon, InfoIcon, WarningIcon, XIcon } from './Icons'
@@ -67,6 +67,10 @@ export function Checklist({ checks, selectedId, onSelect, onFixAction, fixingAct
     return values
   }, [checks])
 
+  useEffect(() => {
+    if (filter !== 'all' && counts[filter] === 0) setFilter('all')
+  }, [counts, filter])
+
   const visible = checks.filter((check) => filter === 'all' || checkStatus(check) === filter)
   const grouped = visible.reduce<Record<string, AnalysisCheck[]>>((groups, check) => {
     const category = check.category?.trim() || 'File review'
@@ -133,6 +137,9 @@ export function Checklist({ checks, selectedId, onSelect, onFixAction, fixingAct
                         <span className="check-summary">{check.summary ?? check.message ?? 'Review completed.'}</span>
                         {selected ? (
                           <span className="check-details">
+                            {check.markers?.length ? (
+                              <span><b>Preview</b>{check.markers.length} problem {check.markers.length === 1 ? 'location is' : 'locations are'} circled and numbered.</span>
+                            ) : null}
                             {evidence ? <span><b>Evidence</b>{evidence}</span> : null}
                             {check.correction || check.fix || check.help ? (
                               <span><b>How to fix it in Illustrator</b>{check.correction ?? check.fix ?? check.help}</span>
